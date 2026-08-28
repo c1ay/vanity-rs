@@ -21,9 +21,9 @@ use crate::timing::{Noop, Observer, Stage};
 // Experiments remain available only to the test harness. Arithmetic and
 // threadgroup candidates from earlier rounds stay off; threadgroup Montgomery
 // invert was measured and rejected. Defaults that passed the retention gate:
-// two in-flight GPU commands, 16-bit fixed-base windows, and per-thread
-// chunked Montgomery inversion (chunk = 8). Bit-interleaved Keccak (keccak)
-// stayed within noise on top of them and remains off.
+// two in-flight GPU commands, 16-bit fixed-base windows, per-thread
+// chunked Montgomery inversion (chunk = 8), and a fused jacobian+invert
+// kernel. Bit-interleaved Keccak stayed within noise and remains off.
 #[derive(Clone, Copy)]
 pub(crate) struct MetalConfig {
     pub(crate) bulk: bool,
@@ -35,6 +35,7 @@ pub(crate) struct MetalConfig {
     pub(crate) inflight: u8,
     pub(crate) chunk: u8,
     pub(crate) keccak: bool,
+    pub(crate) fuse: bool,
 }
 
 impl Default for MetalConfig {
@@ -49,6 +50,7 @@ impl Default for MetalConfig {
             inflight: 2,
             chunk: 8,
             keccak: false,
+            fuse: true,
         }
     }
 }
@@ -71,6 +73,14 @@ impl MetalConfig {
             self.chunk == 0 || !self.invert,
             "chunked and threadgroup inversion are mutually exclusive"
         );
+        ensure!(
+            !self.fuse || self.chunk > 0,
+            "VANITY_BENCH_FUSE requires VANITY_BENCH_CHUNK 4 or 8"
+        );
+        ensure!(
+            !self.fuse || !self.invert,
+            "fused and threadgroup inversion are mutually exclusive"
+        );
         Ok(())
     }
 }
@@ -85,6 +95,7 @@ impl MetalConfig {
             ("VANITY_BENCH_ADD", &mut config.fast_add),
             ("VANITY_BENCH_INVERT", &mut config.invert),
             ("VANITY_BENCH_KECCAK", &mut config.keccak),
+            ("VANITY_BENCH_FUSE", &mut config.fuse),
         ] {
             if let Ok(value) = std::env::var(name) {
                 *setting = match value.as_str() {
@@ -112,6 +123,9 @@ impl MetalConfig {
         } else if config.invert {
             // Threadgroup inversion excludes the default chunked inversion.
             config.chunk = 0;
+        }
+        if config.invert && std::env::var("VANITY_BENCH_FUSE").is_err() {
+            config.fuse = false;
         }
         config.validate()?;
         Ok(config)
@@ -317,7 +331,7 @@ impl MetalBackend {
                 .map_err(|error| anyhow!("Metal shader compilation failed: {error}"))?;
             let pipeline =
                 pipeline_with_group(&device, &library, "derive_addresses", config.group)?;
-            let split = config.invert || config.chunk > 0;
+            let split = config.invert || (config.chunk > 0 && !config.fuse);
             let jacobian = split
                 .then(|| pipeline_with_group(&device, &library, "jacobian_points", config.group))
                 .transpose()?;
@@ -332,7 +346,11 @@ impl MetalBackend {
                     pipeline_with_group(
                         &device,
                         &library,
-                        "chunk_invert_affine_keccak",
+                        if config.fuse {
+                            "chunk_derive_addresses"
+                        } else {
+                            "chunk_invert_affine_keccak"
+                        },
                         config.group,
                     )
                 })
@@ -721,7 +739,20 @@ impl MetalBackend {
             };
             let slot = &self.slots[submit_at];
             let chunk = self.config.chunk as usize;
-            if invert || chunk > 0 {
+            if self.config.fuse {
+                let pipeline = self
+                    .chunk_pipeline
+                    .as_ref()
+                    .context("fused path missing chunk pipeline")?;
+                encode_compute(
+                    &completion.command,
+                    pipeline,
+                    (&slot.input, &self.table, &slot.output),
+                    keys.len(),
+                    keys.len().div_ceil(chunk),
+                    group,
+                )?;
+            } else if invert || chunk > 0 {
                 let jacobian = self
                     .jacobian
                     .as_ref()
@@ -1008,6 +1039,15 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.invert = false;
         assert!(invalid.validate().is_ok());
+        invalid.fuse = true;
+        invalid.chunk = 0;
+        assert!(invalid.validate().is_err());
+        invalid.chunk = 8;
+        assert!(invalid.validate().is_ok());
+        invalid.invert = true;
+        assert!(invalid.validate().is_err());
+        invalid.invert = false;
+        assert!(invalid.validate().is_ok());
         assert_eq!(table_bytes(4), 64 * 16 * 64);
         assert_eq!(table_bytes(8), 32 * 256 * 64);
         assert_eq!(table_bytes(16), 16 * 65536 * 64);
@@ -1135,6 +1175,7 @@ mod tests {
                 MetalConfig {
                     chunk: 0,
                     window_bits: 8,
+                    fuse: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
@@ -1153,6 +1194,10 @@ mod tests {
                 },
                 MetalConfig {
                     keccak: true,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    fuse: false,
                     ..MetalConfig::default()
                 },
             ];

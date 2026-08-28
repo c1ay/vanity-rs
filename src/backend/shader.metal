@@ -544,20 +544,14 @@ kernel void invert_affine_keccak(device const uint *xyz [[buffer(0)]],
 // lane). Zero Z never occurs for host-validated scalars, but the same mask
 // defense as invert_affine_keccak is kept: a zero Z contributes 1 to the
 // running product and its inverse is forced back to zero.
-kernel void chunk_invert_affine_keccak(device const uint *xyz [[buffer(0)]],
-                                       device const uint *unused [[buffer(1)]],
-                                       device uchar *addresses [[buffer(2)]],
-                                       constant uint &count [[buffer(3)]],
-                                       uint gid [[thread_position_in_grid]]) {
-    (void)unused;
-    uint base = gid * CHUNK_SIZE;
-    if (base >= count) return; // public batch boundary
+inline void montgomery_chunk_affine_keccak(thread const Point *pts, uint base, uint count,
+                                           device uchar *addresses) {
     Fe prefix[CHUNK_SIZE];
     uint zero_mask[CHUNK_SIZE];
     Fe acc = fe_one();
     for (uint i = 0; i < CHUNK_SIZE; ++i) {
         uint index = base + i;
-        Fe z = index < count ? load_fe(xyz + index * 24 + 16) : fe_one();
+        Fe z = index < count ? pts[i].z : fe_one();
         zero_mask[i] = fe_zero_mask(z);
         acc = fe_mul(acc, fe_select(z, fe_one(), zero_mask[i]));
         prefix[i] = acc;
@@ -569,15 +563,52 @@ kernel void chunk_invert_affine_keccak(device const uint *xyz [[buffer(0)]],
         uint index = base + i;
         Fe z_inv = i == 0 ? inv : fe_mul(inv, prefix[i - 1]);
         if (index < count) {
-            device const uint *slot = xyz + index * 24;
             // Padding lanes contributed 1, so skipping their inv update is exact.
-            inv = fe_mul(inv, fe_select(load_fe(slot + 16), fe_one(), zero_mask[i]));
+            inv = fe_mul(inv, fe_select(pts[i].z, fe_one(), zero_mask[i]));
             z_inv = fe_select(z_inv, fe_zero(), zero_mask[i]);
             Fe inverse2 = fe_square(z_inv);
-            Point point = {fe_mul(load_fe(slot), inverse2),
-                           fe_mul(load_fe(slot + 8), fe_mul(inverse2, z_inv)), fe_one()};
+            Point point = {fe_mul(pts[i].x, inverse2),
+                           fe_mul(pts[i].y, fe_mul(inverse2, z_inv)), fe_one()};
             eth_address(point, addresses + index * 20);
         }
     }
+}
+
+kernel void chunk_invert_affine_keccak(device const uint *xyz [[buffer(0)]],
+                                       device const uint *unused [[buffer(1)]],
+                                       device uchar *addresses [[buffer(2)]],
+                                       constant uint &count [[buffer(3)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    (void)unused;
+    uint base = gid * CHUNK_SIZE;
+    if (base >= count) return; // public batch boundary
+    Point pts[CHUNK_SIZE];
+    for (uint i = 0; i < CHUNK_SIZE; ++i) {
+        uint index = base + i;
+        if (index < count) {
+            device const uint *slot = xyz + index * 24;
+            pts[i].x = load_fe(slot);
+            pts[i].y = load_fe(slot + 8);
+            pts[i].z = load_fe(slot + 16);
+        }
+    }
+    montgomery_chunk_affine_keccak(pts, base, count, addresses);
+}
+
+// Same chunk invert, but Jacobian stays in thread storage: no 96-byte/point
+// device round-trip. Register pressure may spill; that is a measured tradeoff.
+kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
+                                   device const uint *table [[buffer(1)]],
+                                   device uchar *addresses [[buffer(2)]],
+                                   constant uint &count [[buffer(3)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    uint base = gid * CHUNK_SIZE;
+    if (base >= count) return;
+    Point pts[CHUNK_SIZE];
+    for (uint i = 0; i < CHUNK_SIZE; ++i) {
+        uint index = base + i;
+        if (index < count) pts[i] = public_jacobian(keys + index * 32, table);
+    }
+    montgomery_chunk_affine_keccak(pts, base, count, addresses);
 }
 #endif

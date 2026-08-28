@@ -47,7 +47,11 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 ## 线程内分块 Montgomery 求逆
 
-`chunk_invert_affine_keccak` 让每个线程独立处理 `CHUNK_SIZE` 个连续点：正向累积前缀积（线程私有数组，无 barrier、无 threadgroup 内存），一次 `fe_inverse` 后反向展开，把每地址约 270 次域乘的求逆摊薄为 ~270/C + 3 次乘法。零 Z 沿用掩码防御（乘积中换 1，逆元清零）；尾部不足 C 项的线程按 `index < count` 跳过，填充项贡献 1、跳过 inv 更新是精确的。与 `jacobian_points` 拆核配合，第二内核 dispatch 宽度为 `ceil(count / C)`。被否决的 threadgroup 版本（串行压在 lane 0）保留为 `VANITY_BENCH_INVERT`，与 chunk 互斥。默认 `CHUNK_SIZE=8`。
+`chunk_invert_affine_keccak` 让每个线程独立处理 `CHUNK_SIZE` 个连续点：正向累积前缀积（线程私有数组，无 barrier、无 threadgroup 内存），一次 `fe_inverse` 后反向展开，把每地址约 270 次域乘的求逆摊薄为 ~270/C + 3 次乘法。零 Z 沿用掩码防御（乘积中换 1，逆元清零）；尾部不足 C 项的线程按 `index < count` 跳过，填充项贡献 1、跳过 inv 更新是精确的。被否决的 threadgroup 版本（串行压在 lane 0）保留为 `VANITY_BENCH_INVERT`，与 chunk 互斥。默认 `CHUNK_SIZE=8`。
+
+## 融合 Jacobian + 分块求逆
+
+默认不再把 `jacobian_points` 的 96 字节/点写到 device 再读回。`chunk_derive_addresses` 在同一线程里算出 Jacobian、做分块求逆并 Keccak，dispatch 宽度为 `ceil(count / C)`，不分配 xyz 缓冲。拆核路径仍可通过 `VANITY_BENCH_FUSE=0` 对照。持续基准中融合在 batch 262144 上约 +20%、65536 上约 +4.6%，超过 3% 保留门槛，默认开启。
 
 ## 位交错 Keccak（实验，未启用）
 
@@ -55,4 +59,4 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 ## 双在途 GPU 命令
 
-`AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（求逆或分块求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。
+`AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（仅拆核/threadgroup 求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。
