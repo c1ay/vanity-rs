@@ -6,7 +6,7 @@
 
 - Keys are produced with `OsRng` → ChaCha20 and rejection sampling of valid secp256k1 scalars. There is no sequential key scan and no production fixed-seed switch.
 - Hits are written to disk with Unix mode `0600`. Default logs omit private keys; `--stdout` prints them.
-- The Metal backend is a custom finite-field / secp256k1 / Keccak implementation. Start-up self-tests and per-batch CPU checks compare GPU results to libsecp256k1 and tiny-keccak. **Those checks are not a substitute for an independent cryptographic or side-channel audit.**
+- The Metal and Vulkan backends are custom finite-field / secp256k1 / Keccak implementations. Start-up self-tests and per-batch CPU checks compare GPU results to libsecp256k1 and tiny-keccak. **Those checks are not a substitute for an independent cryptographic or side-channel audit.**
 
 Do not share `found_wallet.jsonl`, `found_wallet-closest.json`, or terminal output that includes `--stdout`.
 

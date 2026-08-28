@@ -107,11 +107,17 @@ fn exercise(backend: &str, batch: &str) {
         check_wallet(&record, "a", "f", &result);
         check_permissions(&closest);
         check_permissions(&out);
-        if backend == "metal" || backend == "auto" {
-            assert!(String::from_utf8_lossy(&result.stderr).contains("Backend: metal"));
-            assert!(
-                String::from_utf8_lossy(&result.stderr).contains("--workers only applies to CPU")
-            );
+        if backend == "metal" || backend == "vulkan" || backend == "auto" {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            if backend == "auto" {
+                assert!(
+                    stderr.contains("Backend: metal") || stderr.contains("Backend: vulkan"),
+                    "{stderr}"
+                );
+            } else {
+                assert!(stderr.contains(&format!("Backend: {backend}")), "{stderr}");
+            }
+            assert!(stderr.contains("--workers only applies to CPU"), "{stderr}");
         }
     }
     assert_eq!(fs::read_to_string(&out).unwrap().lines().count(), 2);
@@ -194,6 +200,30 @@ fn metal_cli_compatibility_and_persistence() {
     let path = directory.path().join("default.jsonl");
     let result = run(
         &["--backend", "metal", "--prefix", "a", "--suffix", "f"],
+        &path,
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let record = serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+    check_wallet(&record, "a", "f", &result);
+    assert_eq!(record["worker_id"], 0);
+    check_permissions(&path);
+}
+
+#[test]
+#[ignore = "requires a real Vulkan compute device and runs the production binary"]
+fn vulkan_cli_compatibility_and_persistence() {
+    for batch in ["1", "33", "4096", "65536", "131072", "262144"] {
+        exercise("vulkan", batch);
+    }
+    exercise("auto", "4096");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("default.jsonl");
+    let result = run(
+        &["--backend", "vulkan", "--prefix", "a", "--suffix", "f"],
         &path,
     );
     assert!(

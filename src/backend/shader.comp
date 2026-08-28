@@ -1,0 +1,335 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Production path only: 16-bit fixed-base windows, fused per-thread chunked
+// inversion, Ethereum Keccak-256. Layout matches shader.metal byte-for-byte
+// for keys (32 raw secret bytes) and addresses (20 raw bytes).
+
+#define WINDOW_BITS 16
+#define CHUNK_SIZE 8
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer KeyBuf {
+    uint words[];
+} keys;
+
+layout(std430, set = 0, binding = 1) readonly buffer TableBuf {
+    uint words[];
+} table;
+
+layout(std430, set = 0, binding = 2) writeonly buffer AddrBuf {
+    uint words[];
+} addresses;
+
+layout(push_constant) uniform Push {
+    uint count;
+} push;
+
+struct Fe { uint v[8]; };
+struct Point { Fe x; Fe y; Fe z; };
+
+const uint FIELD_P[8] = uint[8](0xfffffc2fu, 0xfffffffeu, 0xffffffffu, 0xffffffffu,
+                                0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+
+Fe fe_zero() {
+    Fe r;
+    for (uint i = 0; i < 8; ++i) r.v[i] = 0u;
+    return r;
+}
+
+Fe fe_one() {
+    Fe r = fe_zero();
+    r.v[0] = 1u;
+    return r;
+}
+
+uint mask_if(bool b) { return uint(-int(b)); }
+
+Fe fe_select(Fe a, Fe b, uint mask) {
+    Fe r;
+    for (uint i = 0; i < 8; ++i) r.v[i] = (a.v[i] & ~mask) | (b.v[i] & mask);
+    return r;
+}
+
+uint fe_zero_mask(Fe a) {
+    uint bits = 0u;
+    for (uint i = 0; i < 8; ++i) bits |= a.v[i];
+    return mask_if(bits == 0u);
+}
+
+Fe fe_normalize(Fe a) {
+    Fe d;
+    uint64_t borrow = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sub = uint64_t(FIELD_P[i]) + borrow;
+        d.v[i] = a.v[i] - uint(sub);
+        borrow = uint64_t(uint64_t(a.v[i]) < sub);
+    }
+    return fe_select(d, a, mask_if(borrow != 0ul));
+}
+
+Fe fe_reduce(uint t[16]) {
+    uint r[10];
+    for (uint i = 0; i < 10; ++i) r[i] = 0u;
+    uint64_t carry = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sum = uint64_t(t[i]) + uint64_t(t[i + 8]) * 977ul + carry;
+        if (i != 0u) sum += uint64_t(t[i + 7]);
+        r[i] = uint(sum);
+        carry = sum >> 32;
+    }
+    uint64_t top = uint64_t(t[15]) + carry;
+    r[8] = uint(top);
+    r[9] = uint(top >> 32);
+
+    carry = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sum = uint64_t(r[i]) + carry;
+        if (i == 0u) sum += uint64_t(r[8]) * 977ul;
+        if (i == 1u) sum += uint64_t(r[8]) + uint64_t(r[9]) * 977ul;
+        if (i == 2u) sum += uint64_t(r[9]);
+        r[i] = uint(sum);
+        carry = sum >> 32;
+    }
+    uint64_t high = carry;
+    carry = 0ul;
+    Fe reduced;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sum = uint64_t(r[i]) + carry;
+        if (i == 0u) sum += high * 977ul;
+        if (i == 1u) sum += high;
+        reduced.v[i] = uint(sum);
+        carry = sum >> 32;
+    }
+    return fe_normalize(reduced);
+}
+
+Fe fe_add(Fe a, Fe b) {
+    uint t[16];
+    for (uint i = 0; i < 16; ++i) t[i] = 0u;
+    uint64_t carry = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sum = uint64_t(a.v[i]) + uint64_t(b.v[i]) + carry;
+        t[i] = uint(sum);
+        carry = sum >> 32;
+    }
+    t[8] = uint(carry);
+    return fe_reduce(t);
+}
+
+Fe fe_sub(Fe a, Fe b) {
+    Fe r;
+    uint64_t borrow = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sub = uint64_t(b.v[i]) + borrow;
+        r.v[i] = a.v[i] - uint(sub);
+        borrow = uint64_t(uint64_t(a.v[i]) < sub);
+    }
+    uint mask = mask_if(borrow != 0ul);
+    uint64_t carry = 0ul;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t sum = uint64_t(r.v[i]) + uint64_t(FIELD_P[i] & mask) + carry;
+        r.v[i] = uint(sum);
+        carry = sum >> 32;
+    }
+    return r;
+}
+
+Fe fe_mul(Fe a, Fe b) {
+    uint t[16];
+    for (uint i = 0; i < 16; ++i) t[i] = 0u;
+    for (uint i = 0; i < 8; ++i) {
+        uint64_t carry = 0ul;
+        for (uint j = 0; j < 8; ++j) {
+            uint64_t product = uint64_t(a.v[i]) * uint64_t(b.v[j]) + uint64_t(t[i + j]) + carry;
+            t[i + j] = uint(product);
+            carry = product >> 32;
+        }
+        t[i + 8] = uint(carry);
+    }
+    return fe_reduce(t);
+}
+
+Fe fe_square(Fe a) { return fe_mul(a, a); }
+
+Fe fe_squares(Fe a, uint count) {
+    for (uint i = 0; i < count; ++i) a = fe_square(a);
+    return a;
+}
+
+Fe fe_inverse(Fe a) {
+    Fe x2 = fe_mul(fe_square(a), a);
+    Fe x3 = fe_mul(fe_square(x2), a);
+    Fe x6 = fe_mul(fe_squares(x3, 3u), x3);
+    Fe x9 = fe_mul(fe_squares(x6, 3u), x3);
+    Fe x11 = fe_mul(fe_squares(x9, 2u), x2);
+    Fe x22 = fe_mul(fe_squares(x11, 11u), x11);
+    Fe x44 = fe_mul(fe_squares(x22, 22u), x22);
+    Fe x88 = fe_mul(fe_squares(x44, 44u), x44);
+    Fe x176 = fe_mul(fe_squares(x88, 88u), x88);
+    Fe x220 = fe_mul(fe_squares(x176, 44u), x44);
+    Fe x223 = fe_mul(fe_squares(x220, 3u), x3);
+    Fe t = fe_mul(fe_squares(x223, 23u), x22);
+    t = fe_mul(fe_squares(t, 5u), a);
+    t = fe_mul(fe_squares(t, 3u), x2);
+    return fe_mul(fe_squares(t, 2u), a);
+}
+
+Point point_select(Point a, Point b, uint mask) {
+    Point r;
+    r.x = fe_select(a.x, b.x, mask);
+    r.y = fe_select(a.y, b.y, mask);
+    r.z = fe_select(a.z, b.z, mask);
+    return r;
+}
+
+Point add_window(Point a, Fe bx, Fe by, uint digit) {
+    Fe zz = fe_square(a.z);
+    Fe u = fe_mul(bx, zz);
+    Fe s = fe_mul(by, fe_mul(a.z, zz));
+    Fe h = fe_sub(u, a.x);
+    Fe r = fe_sub(s, a.y);
+    Fe hh = fe_square(h);
+    Fe hhh = fe_mul(h, hh);
+    Fe v = fe_mul(a.x, hh);
+    Point summed;
+    summed.x = fe_sub(fe_sub(fe_square(r), hhh), fe_add(v, v));
+    summed.y = fe_sub(fe_mul(r, fe_sub(v, summed.x)), fe_mul(a.y, hhh));
+    summed.z = fe_mul(a.z, h);
+    Point b;
+    b.x = bx;
+    b.y = by;
+    b.z = fe_one();
+    summed = point_select(summed, b, fe_zero_mask(a.z));
+    return point_select(summed, a, mask_if(digit == 0u));
+}
+
+uint key_byte(uint key_index, uint i) {
+    uint word = keys.words[key_index * 8u + i / 4u];
+    return (word >> ((i % 4u) * 8u)) & 0xffu;
+}
+
+void window_point(uint key_index, uint window, out Fe x, out Fe y, out uint digit) {
+    x = fe_zero();
+    y = fe_zero();
+    digit = key_byte(key_index, 31u - 2u * window) | (key_byte(key_index, 30u - 2u * window) << 8);
+    uint offset = (window * 65536u + digit) * 16u;
+    for (uint limb = 0; limb < 8; ++limb) {
+        x.v[limb] = table.words[offset + limb];
+        y.v[limb] = table.words[offset + 8u + limb];
+    }
+}
+
+Point public_jacobian(uint key_index) {
+    Point sum;
+    sum.x = fe_zero();
+    sum.y = fe_one();
+    sum.z = fe_zero();
+    for (uint window = 0; window < (256u / WINDOW_BITS); ++window) {
+        Fe x, y;
+        uint digit;
+        window_point(key_index, window, x, y, digit);
+        sum = add_window(sum, x, y, digit);
+    }
+    return sum;
+}
+
+uint coordinate_byte(Fe a, uint index) {
+    return (a.v[7u - index / 4u] >> ((3u - index % 4u) * 8u)) & 0xffu;
+}
+
+const uint KECCAK_ROT[25] = uint[25](
+    0u, 1u, 62u, 28u, 27u, 36u, 44u, 6u, 55u, 20u, 3u, 10u, 43u, 25u, 39u, 41u, 45u, 15u, 21u, 8u,
+    18u, 2u, 61u, 56u, 14u);
+
+const uint64_t KECCAK_RC[24] = uint64_t[24](
+    0x0000000000000001ul, 0x0000000000008082ul, 0x800000000000808aul, 0x8000000080008000ul,
+    0x000000000000808bul, 0x0000000080000001ul, 0x8000000080008081ul, 0x8000000000008009ul,
+    0x000000000000008aul, 0x0000000000000088ul, 0x0000000080008009ul, 0x000000008000000aul,
+    0x000000008000808bul, 0x800000000000008bul, 0x8000000000008089ul, 0x8000000000008003ul,
+    0x8000000000008002ul, 0x8000000000000080ul, 0x000000000000800aul, 0x800000008000000aul,
+    0x8000000080008081ul, 0x8000000000008080ul, 0x0000000080000001ul, 0x8000000080008008ul);
+
+uint64_t rol(uint64_t x, uint n) { return (x << n) | (x >> ((64u - n) & 63u)); }
+
+void store_address(uint index, uint b[20]) {
+    for (uint w = 0; w < 5u; ++w) {
+        addresses.words[index * 5u + w] = b[w * 4u]
+            | (b[w * 4u + 1u] << 8)
+            | (b[w * 4u + 2u] << 16)
+            | (b[w * 4u + 3u] << 24);
+    }
+}
+
+void eth_address(Point point, uint index) {
+    uint64_t state[25];
+    for (uint i = 0; i < 25; ++i) state[i] = 0ul;
+    for (uint i = 0; i < 32; ++i) {
+        state[i / 8u] |= uint64_t(coordinate_byte(point.x, i)) << ((i % 8u) * 8u);
+        state[4u + i / 8u] |= uint64_t(coordinate_byte(point.y, i)) << ((i % 8u) * 8u);
+    }
+    state[8] = 1ul;
+    state[16] = 0x8000000000000000ul;
+    for (uint round = 0; round < 24; ++round) {
+        uint64_t c[5];
+        uint64_t b[25];
+        for (uint x = 0; x < 5; ++x)
+            c[x] = state[x] ^ state[x + 5u] ^ state[x + 10u] ^ state[x + 15u] ^ state[x + 20u];
+        for (uint x = 0; x < 5; ++x) {
+            uint64_t d = c[(x + 4u) % 5u] ^ rol(c[(x + 1u) % 5u], 1u);
+            for (uint y = 0; y < 5; ++y) state[x + 5u * y] ^= d;
+        }
+        for (uint x = 0; x < 5; ++x)
+            for (uint y = 0; y < 5; ++y)
+                b[y + 5u * ((2u * x + 3u * y) % 5u)] = rol(state[x + 5u * y], KECCAK_ROT[x + 5u * y]);
+        for (uint x = 0; x < 5; ++x)
+            for (uint y = 0; y < 5; ++y)
+                state[x + 5u * y] = b[x + 5u * y] ^ ((~b[(x + 1u) % 5u + 5u * y]) & b[(x + 2u) % 5u + 5u * y]);
+        state[0] ^= KECCAK_RC[round];
+    }
+    uint digest[20];
+    for (uint i = 0; i < 20; ++i)
+        digest[i] = uint((state[(i + 12u) / 8u] >> (((i + 12u) % 8u) * 8u)) & 0xfful);
+    store_address(index, digest);
+}
+
+void montgomery_chunk_affine_keccak(Point pts[CHUNK_SIZE], uint base, uint count) {
+    Fe prefix[CHUNK_SIZE];
+    uint zero_mask[CHUNK_SIZE];
+    Fe acc = fe_one();
+    for (uint i = 0; i < CHUNK_SIZE; ++i) {
+        uint index = base + i;
+        Fe z = index < count ? pts[i].z : fe_one();
+        zero_mask[i] = fe_zero_mask(z);
+        acc = fe_mul(acc, fe_select(z, fe_one(), zero_mask[i]));
+        prefix[i] = acc;
+    }
+    Fe inv = fe_inverse(prefix[CHUNK_SIZE - 1]);
+    for (uint i = CHUNK_SIZE; i-- > 0u; ) {
+        uint index = base + i;
+        Fe z_inv = i == 0u ? inv : fe_mul(inv, prefix[i - 1u]);
+        if (index < count) {
+            inv = fe_mul(inv, fe_select(pts[i].z, fe_one(), zero_mask[i]));
+            z_inv = fe_select(z_inv, fe_zero(), zero_mask[i]);
+            Fe inverse2 = fe_square(z_inv);
+            Point point;
+            point.x = fe_mul(pts[i].x, inverse2);
+            point.y = fe_mul(pts[i].y, fe_mul(inverse2, z_inv));
+            point.z = fe_one();
+            eth_address(point, index);
+        }
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint base = gid * CHUNK_SIZE;
+    if (base >= push.count) return;
+    Point pts[CHUNK_SIZE];
+    for (uint i = 0; i < CHUNK_SIZE; ++i) {
+        uint index = base + i;
+        if (index < push.count) pts[i] = public_jacobian(index);
+    }
+    montgomery_chunk_affine_keccak(pts, base, push.count);
+}

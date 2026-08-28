@@ -842,7 +842,7 @@ mod tests {
     fn timed_search(
         secp: &Arc<Secp256k1<All>>,
         workers: usize,
-        metal: Option<&mut crate::backend::metal::MetalBackend>,
+        gpu: Option<&mut crate::backend::GpuBackend>,
         batch_size: usize,
         duration: std::time::Duration,
         profiled: bool,
@@ -859,7 +859,7 @@ mod tests {
         let barrier = std::sync::Barrier::new(workers + 1);
         let directory = tempfile::tempdir()?;
         let snapshot = directory.path().join("closest.json");
-        let mut metal = metal;
+        let mut gpu = gpu;
         let mut started = Instant::now();
         let mut stopped = started;
         let recorder = crate::timing::Recorder::default();
@@ -877,7 +877,7 @@ mod tests {
                     verifier: secp,
                 };
                 let barrier = &barrier;
-                let gpu = metal.take();
+                let gpu = gpu.take();
                 let recorder = recorder.clone();
                 handles.push(scope.spawn(move || {
                     let mut cpu = cpu::CpuBackend::new(Arc::clone(secp));
@@ -931,86 +931,26 @@ mod tests {
         )
     }
 
-    fn benchmark_gpu<O: Observer>(
-        backend: &mut crate::backend::metal::MetalBackend,
+    fn benchmark_gpu<B: AddressBackend, O: Observer>(
+        backend: &mut B,
         batch: usize,
         context: WorkerContext<'_>,
         observer: O,
         pipelined: bool,
     ) -> Result<Option<HitRecord>> {
-        struct Observed<'a, O> {
-            backend: &'a mut crate::backend::metal::MetalBackend,
-            observer: O,
-        }
-        impl<O: Observer> AddressBackend for Observed<'_, O> {
-            fn inflight_capacity(&self) -> usize {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    self.backend.inflight_capacity()
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    1
-                }
-            }
-
-            fn derive_batch(
-                &mut self,
-                keys: &[SecretKey],
-                addresses: &mut [Address],
-            ) -> Result<()> {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    self.backend
-                        .derive_observed(keys, addresses, &self.observer)
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    let _ = &self.observer;
-                    self.backend.derive_batch(keys, addresses)
-                }
-            }
-
-            fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    self.backend.begin_observed(keys, &self.observer)
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    let _ = keys;
-                    self.backend.begin_batch(keys)
-                }
-            }
-
-            fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    self.backend.end_observed(keys, addresses, &self.observer)
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    self.backend.end_batch(keys, addresses)
-                }
-            }
-        }
-        let mut measured = Observed {
-            backend,
-            observer: observer.clone(),
-        };
         if pipelined {
-            pipeline::run(&mut measured, batch, context, |_| {}, observer, seed_rng)
+            pipeline::run(backend, batch, context, |_| {}, observer, seed_rng)
         } else {
-            run_worker_observed(&mut measured, batch, context, |_| {}, observer)
+            run_worker_observed(backend, batch, context, |_| {}, observer)
         }
     }
 
     #[test]
-    #[ignore = "sustained benchmark; requires Metal for VANITY_BENCH_BACKEND=metal"]
+    #[ignore = "sustained benchmark; requires a GPU for VANITY_BENCH_BACKEND=metal|vulkan"]
     fn benchmark_backends() -> Result<()> {
         let name = std::env::var("VANITY_BENCH_BACKEND").unwrap_or_else(|_| "cpu".into());
         ensure!(
-            name == "cpu" || name == "metal",
+            name == "cpu" || name == "metal" || name == "vulkan",
             "unknown benchmark backend"
         );
         let number = |key: &str, default: u64| -> Result<u64> {
@@ -1018,10 +958,10 @@ mod tests {
                 value.parse().context("invalid benchmark setting")
             })
         };
-        let workers = if name == "metal" {
-            1
-        } else {
+        let workers = if name == "cpu" {
             number("VANITY_BENCH_WORKERS", 14)? as usize
+        } else {
+            1
         };
         let batch = number("VANITY_BENCH_BATCH", 4096)? as usize;
         let seconds = number("VANITY_BENCH_SECONDS", 30)?;
@@ -1037,16 +977,21 @@ mod tests {
         );
         let initialization = Instant::now();
         let secp = Arc::new(Secp256k1::new());
-        let mut metal = if name == "metal" {
-            Some(benchmark_metal(batch)?.context("GPU required for benchmark")?)
-        } else {
-            None
+        let mut gpu = match name.as_str() {
+            "metal" => Some(crate::backend::GpuBackend::Metal(
+                benchmark_metal(batch)?.context("GPU required for benchmark")?,
+            )),
+            "vulkan" => Some(crate::backend::GpuBackend::Vulkan(Box::new(
+                crate::backend::vulkan::VulkanBackend::new(batch)?
+                    .context("GPU required for benchmark")?,
+            ))),
+            _ => None,
         };
         let initialization_sec = initialization.elapsed().as_secs_f64();
         timed_search(
             &secp,
             workers,
-            metal.as_mut(),
+            gpu.as_mut(),
             batch,
             std::time::Duration::from_secs(3),
             profiled,
@@ -1057,7 +1002,7 @@ mod tests {
             let value = timed_search(
                 &secp,
                 workers,
-                metal.as_mut(),
+                gpu.as_mut(),
                 batch,
                 std::time::Duration::from_secs(seconds),
                 profiled,

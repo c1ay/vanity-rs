@@ -3,13 +3,13 @@ name = "vanity-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "EVM vanity address generator with CPU parallelism and Apple Silicon Metal GPU support"
+description = "EVM vanity address generator with CPU parallelism, Apple Silicon Metal, and Vulkan GPU search"
 license = "MIT"
 repository = "https://github.com/c1ay/vanity-rs"
 homepage = "https://github.com/c1ay/vanity-rs"
 readme = "README.md"
 authors = ["c1ay <liukaiash@gmail.com>"]
-keywords = ["ethereum", "vanity", "address", "gpu", "metal"]
+keywords = ["ethereum", "vanity", "gpu", "metal", "vulkan"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
@@ -42,6 +42,8 @@ console = "0.15"
 # 原子替换包含私钥的候选快照
 tempfile = "3.27"
 zeroize = "1.8"
+# 动态加载 Vulkan loader（libvulkan.so.1 / vulkan-1.dll），编译期不链接 ICD
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = "0.6.3"

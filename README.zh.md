@@ -1,6 +1,6 @@
 # vanity-rs
 
-EVM 靓号地址生成器，支持十六进制前缀/后缀、CPU 并行搜索和 Apple Silicon Metal GPU 计算。
+EVM 靓号地址生成器，支持十六进制前缀/后缀、CPU 并行搜索、Apple Silicon Metal 以及 Vulkan GPU 计算。
 
 命令行帮助与错误信息为英文。English README: [README.md](README.md)。
 
@@ -9,12 +9,13 @@ EVM 靓号地址生成器，支持十六进制前缀/后缀、CPU 并行搜索�
 ```sh
 cargo run --release -- --prefix dead --suffix beef
 cargo run --release -- --backend metal --gpu-batch-size 65536 --prefix abc
+cargo run --release -- --backend vulkan --gpu-batch-size 65536 --prefix abc
 cargo run --release -- --backend cpu --workers 14 --suffix abc
 ```
 
-`--backend` 默认 `auto`：有可用 Metal 设备时使用 GPU；平台不支持或无法访问设备时提示并使用 CPU。显式指定 `metal` 时不回退。内核编译、自检和运行时校验错误始终报错退出，不用 CPU 静默掩盖错误。`auto` 按设备可用性选择，不会根据速度选择后端。
+`--backend` 默认 `auto`：macOS ARM 上有可用 Metal 设备时使用 GPU；Linux/Windows 上有可用 Vulkan 计算设备时使用 GPU；否则使用 CPU。显式指定 `metal` 或 `vulkan` 时不回退。内核编译、自检和运行时校验错误始终报错退出，不用 CPU 静默掩盖错误。`auto` 按设备可用性选择，不会根据速度选择后端。
 
-Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证；其他平台保留 CPU 实现。MSL 源码嵌入程序并在启动时编译，无需单独的离线 `metal` 编译器。首次启动时间包括编译、固定基点表生成及已知向量自检。
+Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证。Vulkan 在所有平台编译，运行时动态加载系统 Vulkan loader（`libvulkan.so.1` / `vulkan-1.dll`），macOS 上跳过以免与 Metal 争用。没有可用 GPU 的平台保留 CPU 实现。MSL 源码嵌入程序并在启动时编译；Vulkan 使用预编译 SPIR-V（`src/backend/shader.spv`，可用 `glslangValidator -V --target-env vulkan1.1 -o src/backend/shader.spv src/backend/shader.comp` 重建）。首次启动包括建表及已知向量自检。
 
 `--workers` 只控制 CPU 线程数；GPU 模式传入该参数会提示忽略。`--gpu-batch-size` 默认 **262144**，支持 **1–262144**。M4 Pro 持续测试中，262144 约为 **1400 万地址/秒**（16-bit 固定基窗口 + 融合分块求逆 + 两个在途 GPU 命令）。没有启动时自动调优。
 
@@ -32,6 +33,7 @@ Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证；其他平台保�
 
 - `backend::cpu` 使用 libsecp256k1 与 tiny-keccak；CPU 工作线程以单元素批次静态分派，保留流式计算方式。
 - `backend::metal` 管理设备、运行时编译、共享缓冲区及同步。MSL 执行精确整数有限域运算、固定窗口基点乘法和 Ethereum Keccak-256。
+- `backend::vulkan` 管理实例、设备、预编译 SPIR-V、主机可见槽位和 fence。GLSL 内核对应 Metal 生产路径（16-bit 窗口、融合分块求逆）。NVIDIA/Intel 的 Vulkan 设备也可能能跑，验证目标是 AMD。
 - `search` 共用随机数生成、匹配、候选排名、计数及取消逻辑。GPU 仅用一个调度线程；大批次另用一个线程准备私钥，不与 CPU 地址搜索混跑。
 - `main` 负责 CLI、界面和文件输出。候选快照由主线程通过临时文件原子替换，Unix 权限为 `0600`。
 
@@ -63,7 +65,9 @@ cargo clippy --all-targets -- -D warnings
 
 ```sh
 cargo test --release metal_differential -- --ignored --nocapture
+cargo test --release vulkan_differential -- --ignored --nocapture
 cargo test --release --test cli metal_cli_compatibility_and_persistence -- --ignored --nocapture
+cargo test --release --test cli vulkan_cli_compatibility_and_persistence -- --ignored --nocapture
 ```
 
 差分测试覆盖有限域边界运算、已知/单比特/随机私钥、公钥及地址逐项比较、非线程组整数倍批次、最大批次和私钥输入缓冲区清理。CLI 测试验证自动选择、输出格式、权限及写盘失败时的退出。
@@ -74,6 +78,8 @@ cargo test --release --test cli metal_cli_compatibility_and_persistence -- --ign
 VANITY_BENCH_BACKEND=cpu VANITY_BENCH_WORKERS=14 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 VANITY_BENCH_BACKEND=metal VANITY_BENCH_BATCH=262144 \
+  cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
+VANITY_BENCH_BACKEND=vulkan VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 ```
 

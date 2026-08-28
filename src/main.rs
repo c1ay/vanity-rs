@@ -3,7 +3,7 @@ mod search;
 mod timing;
 
 use anyhow::{Context, anyhow};
-use backend::{BackendChoice, Selection, cpu::CpuBackend, metal::MetalBackend};
+use backend::{BackendChoice, Selection, cpu::CpuBackend};
 use clap::{ArgAction, Parser, ValueEnum};
 use console::{Color, Style};
 use crossbeam::channel;
@@ -103,7 +103,7 @@ enum OutFmt {
 #[command(
     name = "vanity-rs",
     version,
-    about = "EVM vanity address generator with prefix/suffix filters, CPU parallelism, and Apple Silicon Metal GPU support"
+    about = "EVM vanity address generator with prefix/suffix filters, CPU parallelism, Apple Silicon Metal, and Vulkan GPU support"
 )]
 struct Args {
     /// Hex prefix without 0x (optional)
@@ -118,11 +118,11 @@ struct Args {
     #[arg(long, default_value_t = 200_000)]
     report_every: u64,
 
-    /// Compute backend: auto prefers Metal and falls back to CPU if unavailable
+    /// Compute backend: auto prefers Metal, then Vulkan, then CPU
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     backend: BackendChoice,
 
-    /// Metal addresses per batch (1..=262144)
+    /// GPU addresses per batch (1..=262144)
     #[arg(long, default_value_t = backend::DEFAULT_GPU_BATCH_SIZE, value_parser = clap::value_parser!(u32).range(1..=backend::MAX_GPU_BATCH_SIZE as i64))]
     gpu_batch_size: u32,
 
@@ -308,29 +308,31 @@ fn main() -> anyhow::Result<()> {
     validate_targets(&args.prefix, &args.suffix)?;
 
     let initialization_start = Instant::now();
-    let selected = backend::select(args.backend, || {
-        MetalBackend::new(args.gpu_batch_size as usize)
-    })?;
-    let (workers, mut metal_backend) = match selected {
+    let selected = backend::select(args.backend, args.gpu_batch_size as usize)?;
+    let (workers, mut gpu_backend) = match selected {
         Selection::Cpu { fallback } => {
             if fallback {
                 warn!(
-                    "Metal unavailable (no accessible GPU or unsupported platform); falling back to CPU"
+                    "GPU unavailable (no accessible Metal or Vulkan device); falling back to CPU"
                 );
             }
             info!("Backend: cpu");
             (args.workers.unwrap_or_else(num_cpus::get).max(1), None)
         }
-        Selection::Metal(metal) => {
+        Selection::Gpu(gpu) => {
             info!(
-                "Backend: metal | Device: {} | Batch: {}",
-                metal.device_name(),
+                "Backend: {} | Device: {} | Batch: {}",
+                gpu.kind_name(),
+                gpu.device_name(),
                 args.gpu_batch_size
             );
             if args.workers.is_some() {
-                warn!("--workers only applies to CPU and is ignored with Metal");
+                warn!(
+                    "--workers only applies to CPU and is ignored with {}",
+                    gpu.kind_name()
+                );
             }
-            (1, Some(metal))
+            (1, Some(gpu))
         }
     };
     info!(
@@ -503,8 +505,8 @@ fn main() -> anyhow::Result<()> {
             let closest_tx = closest_tx.clone();
             let report_every = args.report_every;
             let batch_size = args.gpu_batch_size as usize;
-            let metal = metal_backend.take();
-            let label = if metal.is_some() {
+            let gpu = gpu_backend.take();
+            let label = if gpu.is_some() {
                 "GPU".to_string()
             } else {
                 format!("W{wid}")
@@ -546,9 +548,9 @@ fn main() -> anyhow::Result<()> {
                         format_compact(p.rate)
                     );
                 };
-                let result = match metal {
+                let result = match gpu {
                     Some(mut backend) => {
-                        search::run_gpu_worker(&mut backend, batch_size, context, progress)
+                        search::run_gpu_worker(backend.as_mut(), batch_size, context, progress)
                     }
                     None => search::run_worker(
                         &mut CpuBackend::new(Arc::clone(&secp)),
@@ -876,6 +878,8 @@ mod tests {
         assert_eq!(args.backend, BackendChoice::Metal);
         assert_eq!(args.gpu_batch_size, 33);
         assert_eq!(args.workers, Some(10));
+        let vulkan = Args::try_parse_from(["vanity-rs", "--backend", "vulkan"]).unwrap();
+        assert_eq!(vulkan.backend, BackendChoice::Vulkan);
         for valid in ["1", "65536", "131072", "262144"] {
             let parsed = Args::try_parse_from(["vanity-rs", "--gpu-batch-size", valid]).unwrap();
             assert_eq!(parsed.gpu_batch_size.to_string(), valid);
