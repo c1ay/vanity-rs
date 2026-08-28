@@ -22,7 +22,7 @@ Batches of 65536 or more overlap the next random-key batch on one CPU thread wit
 
 For faster stop response, use `--gpu-batch-size 65536` (observed stop-tail median ~19 ms vs ~50 ms at 262144 with two in-flight commands; observations, not worst-case bounds). Pairing results: [M4 Pro report](docs/performance-m4-pro.md#结构优化2026-08-28第三轮实施).
 
-Hits append to `found_wallet.jsonl` by default; the best candidate is `found_wallet-closest.json`. Use `--format txt` and `--append` for text files. Logs omit private keys unless you pass `--stdout`.
+Hits append to `found_wallet.jsonl` by default; the best candidate is `found_wallet-closest.json`. Use `--format txt` and `--append` for text files. Logs omit private keys unless you pass `--stdout`. The summary line shows elapsed time, overall search rate, progress versus the geometric mean, and ETA (mean / 50% / 95%); worker lines show a recent sample rate.
 
 Requires Rust 1.85+ (`edition = "2024"`).
 

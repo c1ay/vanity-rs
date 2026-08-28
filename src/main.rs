@@ -375,6 +375,18 @@ fn main() -> anyhow::Result<()> {
         percent_str(p_pct),
         format_one_in(one_in)
     );
+    if k == 0 {
+        info!("Expected tries: unconstrained (any address matches)");
+    } else {
+        // 几何分布：期望 one_in，中位数 ln(2)·one_in，95% 分位 -ln(0.05)·one_in
+        info!(
+            "Expected tries: mean 1 in {} | median ~{} | 95% ~{}",
+            format_one_in(one_in),
+            format_one_in(one_in * std::f64::consts::LN_2),
+            format_one_in(one_in * (-0.05_f64.ln()))
+        );
+        info!("Search rate and ETA appear on the summary line after the first samples");
+    }
     info!(
         "Output     : {}  (format: {:?}, {})",
         args.out,
@@ -401,9 +413,11 @@ fn main() -> anyhow::Result<()> {
     {
         let mut note_guard = summary_note.lock().unwrap();
         *note_guard = colorize_note("status: waiting for workers");
-        summary_pb.set_message(colorize_summary(format!(
-            "elapsed 0.0s | total tries 0 | {}",
-            note_guard.as_str()
+        summary_pb.set_message(colorize_summary(format_live_status(
+            0.0,
+            0,
+            one_in,
+            note_guard.as_str(),
         )));
     }
 
@@ -452,6 +466,7 @@ fn main() -> anyhow::Result<()> {
         let tries = Arc::clone(&global_tries);
         let running = Arc::clone(&summary_running);
         let start_snapshot = start_all;
+        let summary_one_in = one_in;
         thread::spawn(move || {
             loop {
                 if !running.load(Ordering::Relaxed) {
@@ -459,17 +474,12 @@ fn main() -> anyhow::Result<()> {
                 }
                 let elapsed = start_snapshot.elapsed().as_secs_f64();
                 let total = tries.load(Ordering::Relaxed);
-                let suffix = {
-                    let note = summary_note.lock().unwrap();
-                    if note.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" | {}", note.as_str())
-                    }
-                };
-                summary_pb.set_message(colorize_summary(format!(
-                    "elapsed {:.1}s | total tries {}{}",
-                    elapsed, total, suffix
+                let note = summary_note.lock().unwrap();
+                summary_pb.set_message(colorize_summary(format_live_status(
+                    elapsed,
+                    total,
+                    summary_one_in,
+                    &note,
                 )));
                 thread::sleep(Duration::from_millis(200));
             }
@@ -524,13 +534,15 @@ fn main() -> anyhow::Result<()> {
                     worker_pb.set_message(colorize_worker(
                         wid,
                         format!(
-                            "[{label}] total={} rate~{:.0}/s sample={address}",
-                            p.total, p.rate
+                            "[{label}] total={} rate={}/s sample={address}",
+                            format_compact(p.total as f64),
+                            format_compact(p.rate),
                         ),
                     ));
                     debug!(
-                        "[{label}] tries={} (~{:.0}/s) sample={address}",
-                        p.completed, p.rate
+                        "[{label}] tries={} ({}/s) sample={address}",
+                        p.completed,
+                        format_compact(p.rate)
                     );
                 };
                 let result = match metal {
@@ -587,11 +599,18 @@ fn main() -> anyhow::Result<()> {
     let summary_handle = &summary_pb;
     let summary_start = start_all;
     if let Some(rec) = received {
+        let elapsed = summary_start.elapsed().as_secs_f64();
+        let total = global_tries.load(Ordering::Relaxed);
         summary_handle.finish_with_message(colorize_summary(format!(
-            "elapsed {:.1}s | match found by worker {} after {} tries",
-            summary_start.elapsed().as_secs_f64(),
+            "elapsed {} | match found by worker {} after {} tries ({}/s)",
+            format_duration(elapsed),
             rec.worker_id,
-            rec.tries
+            rec.tries,
+            format_compact(if elapsed > 0.0 {
+                total as f64 / elapsed
+            } else {
+                0.0
+            }),
         )));
         // 写入文件
         match args.format {
@@ -627,9 +646,17 @@ fn main() -> anyhow::Result<()> {
             );
         }
     } else {
+        let elapsed = summary_start.elapsed().as_secs_f64();
+        let total = global_tries.load(Ordering::Relaxed);
         summary_handle.finish_with_message(colorize_summary(format!(
-            "elapsed {:.1}s | no match found (interrupted)",
-            summary_start.elapsed().as_secs_f64()
+            "elapsed {} | no match found after {} tries ({}/s)",
+            format_duration(elapsed),
+            total,
+            format_compact(if elapsed > 0.0 {
+                total as f64 / elapsed
+            } else {
+                0.0
+            }),
         )));
         warn!("No hit (search interrupted).");
     }
@@ -639,7 +666,16 @@ fn main() -> anyhow::Result<()> {
 
     let wall = start_all.elapsed().as_secs_f64();
     let total_attempts = global_tries.load(Ordering::Relaxed);
-    info!("WallTime: {:.1}s | Total tries: {}", wall, total_attempts);
+    info!(
+        "WallTime: {} | Total tries: {} | Average rate: {}/s",
+        format_duration(wall),
+        total_attempts,
+        format_compact(if wall > 0.0 {
+            total_attempts as f64 / wall
+        } else {
+            0.0
+        })
+    );
 
     Ok(())
 }
@@ -650,9 +686,125 @@ fn format_one_in(v: f64) -> String {
         "∞".into()
     } else if v >= 1e9 {
         format!("{:.3e}", v)
-    } else {
+    } else if v >= 1.0 {
         format!("{}", v as u128)
+    } else {
+        format!("{v:.3}")
     }
+}
+
+/// 将尝试次数或速率格式为紧凑英文单位
+fn format_compact(n: f64) -> String {
+    if !n.is_finite() || n < 0.0 {
+        return "n/a".into();
+    }
+    if n >= 1e12 {
+        format!("{:.2}T", n / 1e12)
+    } else if n >= 1e9 {
+        format!("{:.2}B", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.2}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.1}k", n / 1e3)
+    } else if n >= 10.0 {
+        format!("{:.0}", n)
+    } else if n > 0.0 {
+        format!("{:.1}", n)
+    } else {
+        "0".into()
+    }
+}
+
+/// 将秒数格式为短人类可读时长
+fn format_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "n/a".into();
+    }
+    const YEAR: f64 = 365.25 * 86_400.0;
+    if secs >= 100.0 * YEAR {
+        return ">100y".into();
+    }
+    if secs >= YEAR {
+        return format!("{:.1}y", secs / YEAR);
+    }
+    if secs >= 86_400.0 {
+        let days = (secs / 86_400.0).floor() as u64;
+        let hours = ((secs % 86_400.0) / 3_600.0).floor() as u64;
+        return format!("{days}d{hours}h");
+    }
+    if secs < 60.0 {
+        return format!("{:.1}s", secs);
+    }
+    let total = secs.round() as u64;
+    let hours = total / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m{seconds:02}s")
+    }
+}
+
+/// 几何分布剩余等待：无记忆，期望尝试次数恒为 one_in
+fn format_eta(one_in: f64, rate: f64) -> String {
+    if !rate.is_finite() || rate <= 0.0 || !one_in.is_finite() {
+        return "ETA n/a".into();
+    }
+    if one_in <= 1.0 {
+        return "ETA <1s".into();
+    }
+    let mean = one_in / rate;
+    let median = std::f64::consts::LN_2 * mean;
+    let p95 = (-0.05_f64.ln()) * mean;
+    format!(
+        "ETA ~{} (50% ~{} · 95% ~{})",
+        format_duration(mean),
+        format_duration(median),
+        format_duration(p95)
+    )
+}
+
+/// 摘要行：已用时间、整体速率、相对期望进度、几何 ETA
+fn format_live_status(elapsed: f64, tries: u64, one_in: f64, note: &str) -> String {
+    let rate = if elapsed > 0.0 {
+        tries as f64 / elapsed
+    } else {
+        0.0
+    };
+    let rate_part = if tries == 0 || rate <= 0.0 {
+        "measuring rate".to_string()
+    } else {
+        format!("{}/s", format_compact(rate))
+    };
+    let progress = if one_in > 0.0 && one_in.is_finite() {
+        let ratio = tries as f64 / one_in;
+        if ratio >= 10.0 {
+            format!("{}x mean", format_compact(ratio))
+        } else {
+            format!("{:.1}% of mean", ratio * 100.0)
+        }
+    } else {
+        "n/a".into()
+    };
+    let eta = if tries == 0 || rate <= 0.0 {
+        "ETA pending".to_string()
+    } else {
+        format_eta(one_in, rate)
+    };
+    let extra = if note.is_empty() {
+        String::new()
+    } else {
+        format!(" | {note}")
+    };
+    format!(
+        "elapsed {} | {} | {} tries | {} | {}{extra}",
+        format_duration(elapsed),
+        rate_part,
+        format_compact(tries as f64),
+        progress,
+        eta
+    )
 }
 
 #[cfg(test)]
@@ -679,6 +831,28 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[31] = value;
         SecretKey::from_byte_array(bytes).unwrap()
+    }
+
+    #[test]
+    fn live_status_formats_rate_progress_and_geometric_eta() {
+        assert_eq!(format_compact(6_010_000.0), "6.01M");
+        assert_eq!(format_compact(1_200.0), "1.2k");
+        assert_eq!(format_duration(12.4), "12.4s");
+        assert_eq!(format_duration(754.0), "12m34s");
+        assert_eq!(format_duration(3_661.0), "1h01m");
+        assert_eq!(format_eta(1.0, 1e6), "ETA <1s");
+        let status = format_live_status(10.0, 60_000_000, 16f64.powi(8), "closest 0xab");
+        assert!(status.contains("elapsed 10.0s"), "{status}");
+        assert!(status.contains("6.00M/s"), "{status}");
+        assert!(status.contains("60.00M tries"), "{status}");
+        assert!(status.contains("% of mean"), "{status}");
+        assert!(status.contains("ETA ~"), "{status}");
+        assert!(status.contains("50% ~"), "{status}");
+        assert!(status.contains("95% ~"), "{status}");
+        assert!(status.contains("closest 0xab"), "{status}");
+        let pending = format_live_status(0.2, 0, 65536.0, "");
+        assert!(pending.contains("measuring rate"), "{pending}");
+        assert!(pending.contains("ETA pending"), "{pending}");
     }
 
     #[test]

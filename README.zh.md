@@ -22,7 +22,7 @@ Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证；其他平台保�
 
 更重视停止响应时可显式使用 `--gpu-batch-size 65536`。双在途配置下，65536 停止收尾中位数约为 19ms，262144 约为 50ms；这些是观测值，不是最坏情况保证。完整配对结果见 [性能报告](docs/performance-m4-pro.md#结构优化2026-08-28第三轮实施)。
 
-默认结果写入 `found_wallet.jsonl`，最佳候选写入 `found_wallet-closest.json`。JSON 输出按行追加；TXT 使用 `--format txt`，可配合 `--append`。普通日志不打印私钥；只有显式 `--stdout` 会打印命中私钥。
+默认结果写入 `found_wallet.jsonl`，最佳候选写入 `found_wallet-closest.json`。JSON 输出按行追加；TXT 使用 `--format txt`，可配合 `--append`。普通日志不打印私钥；只有显式 `--stdout` 会打印命中私钥。摘要行会显示已用时间、整体搜索速度、相对几何期望的进度，以及预计等待时间（均值 / 50% / 95%）；工作线程行显示近期采样速率。
 
 需要 Rust 1.85+（`edition = "2024"`）。
 
