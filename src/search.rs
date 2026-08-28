@@ -946,11 +946,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "sustained benchmark; requires a GPU for VANITY_BENCH_BACKEND=metal|vulkan"]
+    #[ignore = "sustained benchmark; requires a GPU for VANITY_BENCH_BACKEND=metal|cuda|vulkan"]
     fn benchmark_backends() -> Result<()> {
         let name = std::env::var("VANITY_BENCH_BACKEND").unwrap_or_else(|_| "cpu".into());
         ensure!(
-            name == "cpu" || name == "metal" || name == "vulkan",
+            name == "cpu" || name == "metal" || name == "cuda" || name == "vulkan",
             "unknown benchmark backend"
         );
         let number = |key: &str, default: u64| -> Result<u64> {
@@ -981,6 +981,10 @@ mod tests {
             "metal" => Some(crate::backend::GpuBackend::Metal(
                 benchmark_metal(batch)?.context("GPU required for benchmark")?,
             )),
+            "cuda" => Some(crate::backend::GpuBackend::Cuda(Box::new(
+                crate::backend::cuda::CudaBackend::new(batch)?
+                    .context("GPU required for benchmark")?,
+            ))),
             "vulkan" => Some(crate::backend::GpuBackend::Vulkan(Box::new(
                 crate::backend::vulkan::VulkanBackend::new(batch)?
                     .context("GPU required for benchmark")?,

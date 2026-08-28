@@ -107,11 +107,13 @@ fn exercise(backend: &str, batch: &str) {
         check_wallet(&record, "a", "f", &result);
         check_permissions(&closest);
         check_permissions(&out);
-        if backend == "metal" || backend == "vulkan" || backend == "auto" {
+        if backend == "metal" || backend == "cuda" || backend == "vulkan" || backend == "auto" {
             let stderr = String::from_utf8_lossy(&result.stderr);
             if backend == "auto" {
                 assert!(
-                    stderr.contains("Backend: metal") || stderr.contains("Backend: vulkan"),
+                    stderr.contains("Backend: metal")
+                        || stderr.contains("Backend: cuda")
+                        || stderr.contains("Backend: vulkan"),
                     "{stderr}"
                 );
             } else {
@@ -224,6 +226,30 @@ fn vulkan_cli_compatibility_and_persistence() {
     let path = directory.path().join("default.jsonl");
     let result = run(
         &["--backend", "vulkan", "--prefix", "a", "--suffix", "f"],
+        &path,
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let record = serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+    check_wallet(&record, "a", "f", &result);
+    assert_eq!(record["worker_id"], 0);
+    check_permissions(&path);
+}
+
+#[test]
+#[ignore = "requires a real CUDA compute device and runs the production binary"]
+fn cuda_cli_compatibility_and_persistence() {
+    for batch in ["1", "33", "4096", "65536", "131072", "262144"] {
+        exercise("cuda", batch);
+    }
+    exercise("auto", "4096");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("default.jsonl");
+    let result = run(
+        &["--backend", "cuda", "--prefix", "a", "--suffix", "f"],
         &path,
     );
     assert!(

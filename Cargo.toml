@@ -3,7 +3,7 @@ name = "vanity-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "EVM vanity address generator with CPU parallelism, Apple Silicon Metal, and Vulkan GPU search"
+description = "EVM vanity address generator with CPU parallelism, Apple Silicon Metal, CUDA, and Vulkan GPU search"
 license = "MIT"
 repository = "https://github.com/c1ay/vanity-rs"
 homepage = "https://github.com/c1ay/vanity-rs"
@@ -44,6 +44,9 @@ tempfile = "3.27"
 zeroize = "1.8"
 # 动态加载 Vulkan loader（libvulkan.so.1 / vulkan-1.dll），编译期不链接 ICD
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+# 动态加载 CUDA 驱动（libcuda.so.1 / nvcuda.dll）。nvrtc feature 仅提供 Ptx::from_src /
+# load_module，不在运行时调用 NVRTC，也不要求本机安装 CUDA Toolkit。
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12060"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = "0.6.3"

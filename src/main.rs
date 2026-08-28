@@ -103,7 +103,7 @@ enum OutFmt {
 #[command(
     name = "vanity-rs",
     version,
-    about = "EVM vanity address generator with prefix/suffix filters, CPU parallelism, Apple Silicon Metal, and Vulkan GPU support"
+    about = "EVM vanity address generator with prefix/suffix filters, CPU parallelism, Apple Silicon Metal, CUDA, and Vulkan GPU support"
 )]
 struct Args {
     /// Hex prefix without 0x (optional)
@@ -118,7 +118,7 @@ struct Args {
     #[arg(long, default_value_t = 200_000)]
     report_every: u64,
 
-    /// Compute backend: auto prefers Metal, then Vulkan, then CPU
+    /// Compute backend: auto prefers Metal, then CUDA, then Vulkan, then CPU
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     backend: BackendChoice,
 
@@ -313,7 +313,7 @@ fn main() -> anyhow::Result<()> {
         Selection::Cpu { fallback } => {
             if fallback {
                 warn!(
-                    "GPU unavailable (no accessible Metal or Vulkan device); falling back to CPU"
+                    "GPU unavailable (no accessible Metal, CUDA, or Vulkan device); falling back to CPU"
                 );
             }
             info!("Backend: cpu");
@@ -880,6 +880,8 @@ mod tests {
         assert_eq!(args.workers, Some(10));
         let vulkan = Args::try_parse_from(["vanity-rs", "--backend", "vulkan"]).unwrap();
         assert_eq!(vulkan.backend, BackendChoice::Vulkan);
+        let cuda = Args::try_parse_from(["vanity-rs", "--backend", "cuda"]).unwrap();
+        assert_eq!(cuda.backend, BackendChoice::Cuda);
         for valid in ["1", "65536", "131072", "262144"] {
             let parsed = Args::try_parse_from(["vanity-rs", "--gpu-batch-size", valid]).unwrap();
             assert_eq!(parsed.gpu_batch_size.to_string(), valid);
@@ -887,7 +889,7 @@ mod tests {
         for invalid in ["0", "262145", "-1", "abc"] {
             assert!(Args::try_parse_from(["vanity-rs", "--gpu-batch-size", invalid]).is_err());
         }
-        assert!(Args::try_parse_from(["vanity-rs", "--backend", "cuda"]).is_err());
+        assert!(Args::try_parse_from(["vanity-rs", "--backend", "opencl"]).is_err());
     }
 
     #[test]

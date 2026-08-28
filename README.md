@@ -1,6 +1,6 @@
 # vanity-rs
 
-EVM vanity address generator: hex prefix/suffix filters, CPU parallelism, Apple Silicon Metal, and Vulkan GPU search.
+EVM vanity address generator: hex prefix/suffix filters, CPU parallelism, Apple Silicon Metal, CUDA, and Vulkan GPU search.
 
 [中文说明](README.zh.md)
 
@@ -9,13 +9,14 @@ EVM vanity address generator: hex prefix/suffix filters, CPU parallelism, Apple 
 ```sh
 cargo run --release -- --prefix dead --suffix beef
 cargo run --release -- --backend metal --gpu-batch-size 65536 --prefix abc
+cargo run --release -- --backend cuda --gpu-batch-size 65536 --prefix abc
 cargo run --release -- --backend vulkan --gpu-batch-size 65536 --prefix abc
 cargo run --release -- --backend cpu --workers 14 --suffix abc
 ```
 
-`--backend` defaults to `auto`: Metal on macOS ARM when a device is available, otherwise Vulkan on Linux/Windows when a suitable compute device is available, otherwise CPU. Explicit `--backend metal` or `--backend vulkan` does not fall back. Shader compile, self-test, and runtime verification failures always abort; they are not silently replaced by CPU. `auto` chooses by device availability, not by speed.
+`--backend` defaults to `auto`: Metal on macOS ARM when a device is available, otherwise CUDA when an NVIDIA driver is available, otherwise Vulkan on Linux/Windows when a suitable compute device is available, otherwise CPU. Explicit `--backend metal`, `--backend cuda`, or `--backend vulkan` does not fall back. Shader compile, self-test, and runtime verification failures always abort; they are not silently replaced by CPU. `auto` chooses by device availability, not by speed.
 
-Metal is enabled on macOS ARM64 and has been measured on M4 Pro. Vulkan is compiled in on all platforms, loads the system Vulkan loader at runtime (`libvulkan.so.1` / `vulkan-1.dll`), and is skipped on macOS so it never competes with Metal. Other platforms without a usable GPU keep the CPU backend. MSL is embedded and compiled at startup; Vulkan ships a precompiled SPIR-V module (`src/backend/shader.spv`, rebuilt with `glslangValidator -V --target-env vulkan1.1 -o src/backend/shader.spv src/backend/shader.comp`). First launch includes table setup and a known-vector self-test.
+Metal is enabled on macOS ARM64 and has been measured on M4 Pro. CUDA loads the NVIDIA driver at runtime (`libcuda.so.1` / `nvcuda.dll`); it is skipped on macOS so it never competes with Metal, and it does not require the CUDA Toolkit or `nvcc` to build or run. Vulkan is compiled in on all platforms, loads the system Vulkan loader at runtime (`libvulkan.so.1` / `vulkan-1.dll`), and is skipped on macOS so it never competes with Metal. Other platforms without a usable GPU keep the CPU backend. MSL is embedded and compiled at startup; CUDA ships precompiled PTX (`src/backend/shader.ptx`, rebuilt with `nvcc -ptx -arch=compute_60 -o src/backend/shader.ptx src/backend/shader.cu`); Vulkan ships a precompiled SPIR-V module (`src/backend/shader.spv`, rebuilt with `glslangValidator -V --target-env vulkan1.1 -o src/backend/shader.spv src/backend/shader.comp`). First launch includes table setup and a known-vector self-test.
 
 `--workers` applies only to CPU; GPU mode warns and ignores it. `--gpu-batch-size` defaults to **262144** (range **1–262144**). On M4 Pro, sustained search at 262144 is about **14.0 million addresses/s** with 16-bit fixed-base windows, fused per-thread chunked inversion, and two in-flight GPU commands. There is no startup auto-tune.
 
@@ -33,6 +34,7 @@ Requires Rust 1.85+ (`edition = "2024"`).
 
 - `backend::cpu` uses libsecp256k1 and tiny-keccak. CPU workers dispatch one-address batches.
 - `backend::metal` owns the device, runtime compile, shared buffers, and sync. MSL does exact integer field arithmetic, fixed-window base-point multiplication, and Ethereum Keccak-256.
+- `backend::cuda` owns the CUDA context, precompiled PTX, dual streams, and events. The CUDA kernel is the production Metal/Vulkan path (16-bit windows, fused chunk-8 invert, block size 128). Requires an NVIDIA driver; compute capability 6.0 or newer.
 - `backend::vulkan` owns the instance, device, precompiled SPIR-V, host-visible slots, and fences. The GLSL kernel is the production Metal path (16-bit windows, fused chunk-8 invert). NVIDIA/Intel Vulkan devices may work; AMD is the validation target.
 - `search` owns RNG, matching, ranking, counters, and cancel. GPU uses one dispatch thread plus an optional key-prep thread.
 - `main` owns the CLI, UI, and files. Closest-candidate snapshots are replaced atomically via a temp file with Unix mode `0600`.
@@ -61,12 +63,14 @@ cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Hardware tests fail if no Metal device is present; they do not skip as pass:
+Hardware tests fail if no matching GPU is present; they do not skip as pass. CUDA hardware acceptance needs Linux/Windows with an NVIDIA driver.
 
 ```sh
 cargo test --release metal_differential -- --ignored --nocapture
+cargo test --release cuda_differential -- --ignored --nocapture
 cargo test --release vulkan_differential -- --ignored --nocapture
 cargo test --release --test cli metal_cli_compatibility_and_persistence -- --ignored --nocapture
+cargo test --release --test cli cuda_cli_compatibility_and_persistence -- --ignored --nocapture
 cargo test --release --test cli vulkan_cli_compatibility_and_persistence -- --ignored --nocapture
 ```
 
@@ -76,6 +80,8 @@ Sustained benches use the production search loop (RNG, match, CPU verify, candid
 VANITY_BENCH_BACKEND=cpu VANITY_BENCH_WORKERS=14 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 VANITY_BENCH_BACKEND=metal VANITY_BENCH_BATCH=262144 \
+  cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
+VANITY_BENCH_BACKEND=cuda VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 VANITY_BENCH_BACKEND=vulkan VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
