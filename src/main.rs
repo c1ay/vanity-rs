@@ -474,7 +474,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 let elapsed = start_snapshot.elapsed().as_secs_f64();
                 let total = tries.load(Ordering::Relaxed);
-                let note = summary_note.lock().unwrap();
+                // 锁只保护 note 的读取；持锁 sleep 会饿死主线程的 save_closest。
+                let note = summary_note.lock().unwrap().clone();
                 summary_pb.set_message(colorize_summary(format_live_status(
                     elapsed,
                     total,
