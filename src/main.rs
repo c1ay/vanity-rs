@@ -633,7 +633,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         writer.flush()?;
-        info!("Wrote hit to {}", &args.out);
+        info!("Wrote hit to {}", args.out);
 
         if args.stdout {
             info!(

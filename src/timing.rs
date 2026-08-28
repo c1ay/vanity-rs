@@ -1,7 +1,12 @@
 //! Statically dispatched diagnostics. Normal searches never read a profiling
 //! clock or acquire a profiling lock; the recorder exists only in test builds.
 
+/// GPU 阶段仅由 Metal 后端构造；枚举在全平台保留，bench JSON 下标才稳定。
 #[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 pub(crate) enum Stage {
     Prepare,
     Upload,
@@ -14,10 +19,20 @@ pub(crate) enum Stage {
 }
 
 pub(crate) trait Observer: Clone + Send {
+    /// Metal 用于跳过 GPU 时间戳采集；非 Metal 平台没有调用点。
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     const ENABLED: bool;
     type Stamp;
     fn start(&self) -> Self::Stamp;
     fn finish(&self, stage: Stage, started: Self::Stamp);
+    /// Metal 命令完成时间；非 Metal 平台没有调用点。
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     fn gpu_seconds(&self, start: f64, end: f64);
 }
 
