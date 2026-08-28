@@ -39,10 +39,20 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 `public_jacobian` 写出每点 96 字节的 `X||Y||Z`。`invert_affine_keccak` 在 threadgroup 内做 Montgomery 乘积求逆（零 Z 先换成 1，再把逆元清零），然后仿射化并做 Keccak。尾组使用 `threads_per_threadgroup`，静态数组上限 256。`derive_batch` 仍同步：两个 compute encoder 落在同一 command buffer 上一次等待。该路径通过差分测试，但持续吞吐低于每地址一次 `fe_inverse`，默认关闭（`VANITY_BENCH_INVERT`）。
 
-## 8-bit 固定基窗口
+## 8/16-bit 固定基窗口与增量建表
 
-表大小为 `windows * radix * 64` 字节。4-bit 仍扫描 16 项，地址只依赖公开循环下标。8-bit 按 digit 索引，`offset = (window * 256 + digit) * 16`；digit 进入地址，这是性能选择。主机用 `digit * 2^(window_bits*window) * G` 填表，digit 0 保持零。默认 `WINDOW_BITS=8`。
+表大小为 `windows * radix * 64` 字节。4-bit 仍扫描 16 项，地址只依赖公开循环下标。8-bit 按 digit 索引，`offset = (window * 256 + digit) * 16`；16-bit 同理，digit 由两个大端字节组成（`key[31-2w]` 为低字节），表为 16 窗 × 65536 项 = 64 MB。digit 进入地址是性能选择，不是常量时间扫描。
+
+表项为公开常量 `digit * 2^(window_bits*window) * G`，digit 0 保持零。主机建表改为增量：每窗口先算基点 `B_w`，随后 `entry[d] = entry[d-1] + B_w` 逐项点加（`PublicKey::combine`，和不可能到无穷点），窗口间并行。单元测试将增量结果与逐项标量乘对照（4/8-bit 全量、16-bit 抽查边界及随机 digit）。默认 `WINDOW_BITS=16`。
+
+## 线程内分块 Montgomery 求逆
+
+`chunk_invert_affine_keccak` 让每个线程独立处理 `CHUNK_SIZE` 个连续点：正向累积前缀积（线程私有数组，无 barrier、无 threadgroup 内存），一次 `fe_inverse` 后反向展开，把每地址约 270 次域乘的求逆摊薄为 ~270/C + 3 次乘法。零 Z 沿用掩码防御（乘积中换 1，逆元清零）；尾部不足 C 项的线程按 `index < count` 跳过，填充项贡献 1、跳过 inv 更新是精确的。与 `jacobian_points` 拆核配合，第二内核 dispatch 宽度为 `ceil(count / C)`。被否决的 threadgroup 版本（串行压在 lane 0）保留为 `VANITY_BENCH_INVERT`，与 chunk 互斥。默认 `CHUNK_SIZE=8`。
+
+## 位交错 Keccak（实验，未启用）
+
+`OPT_KECCAK=1` 把每个 64 位 lane 拆为偶位/奇位两个 32 位字，θ/χ/ι 逐半字操作，ρ 的 64 位旋转变为 32 位旋转（奇数旋转量交换两半）。RC 常量预先交错，吸收/挤出时做位压缩/展开转换。差分正确，但短测中单独约 +1%、叠加在 chunk+16-bit 窗口上约 ±1%，未达 3% 保留门槛，默认关闭（`VANITY_BENCH_KECCAK`）。
 
 ## 双在途 GPU 命令
 
-`AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。
+`AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（求逆或分块求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。

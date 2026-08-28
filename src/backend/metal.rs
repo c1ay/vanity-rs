@@ -19,9 +19,11 @@ use super::{Address, AddressBackend, cpu};
 use crate::timing::{Noop, Observer, Stage};
 
 // Experiments remain available only to the test harness. Arithmetic and
-// threadgroup candidates from the previous round stay off. Threadgroup
-// Montgomery invert was measured and rejected. 8-bit windows and two
-// in-flight GPU commands passed the retention gate and are the defaults.
+// threadgroup candidates from earlier rounds stay off; threadgroup Montgomery
+// invert was measured and rejected. Defaults that passed the retention gate:
+// two in-flight GPU commands, 16-bit fixed-base windows, and per-thread
+// chunked Montgomery inversion (chunk = 8). Bit-interleaved Keccak (keccak)
+// stayed within noise on top of them and remains off.
 #[derive(Clone, Copy)]
 pub(crate) struct MetalConfig {
     pub(crate) bulk: bool,
@@ -31,6 +33,8 @@ pub(crate) struct MetalConfig {
     pub(crate) invert: bool,
     pub(crate) window_bits: u8,
     pub(crate) inflight: u8,
+    pub(crate) chunk: u8,
+    pub(crate) keccak: bool,
 }
 
 impl Default for MetalConfig {
@@ -41,8 +45,10 @@ impl Default for MetalConfig {
             square: false,
             fast_add: false,
             invert: false,
-            window_bits: 8,
+            window_bits: 16,
             inflight: 2,
+            chunk: 8,
+            keccak: false,
         }
     }
 }
@@ -50,12 +56,20 @@ impl Default for MetalConfig {
 impl MetalConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.window_bits == 4 || self.window_bits == 8,
-            "VANITY_BENCH_WINDOW must be 4 or 8"
+            [4, 8, 16].contains(&self.window_bits),
+            "VANITY_BENCH_WINDOW must be 4, 8 or 16"
         );
         ensure!(
             self.inflight == 1 || self.inflight == 2,
             "VANITY_BENCH_INFLIGHT must be 1 or 2"
+        );
+        ensure!(
+            [0, 4, 8].contains(&self.chunk),
+            "VANITY_BENCH_CHUNK must be 0, 4 or 8"
+        );
+        ensure!(
+            self.chunk == 0 || !self.invert,
+            "chunked and threadgroup inversion are mutually exclusive"
         );
         Ok(())
     }
@@ -70,6 +84,7 @@ impl MetalConfig {
             ("VANITY_BENCH_SQUARE", &mut config.square),
             ("VANITY_BENCH_ADD", &mut config.fast_add),
             ("VANITY_BENCH_INVERT", &mut config.invert),
+            ("VANITY_BENCH_KECCAK", &mut config.keccak),
         ] {
             if let Ok(value) = std::env::var(name) {
                 *setting = match value.as_str() {
@@ -91,6 +106,12 @@ impl MetalConfig {
         }
         if let Ok(value) = std::env::var("VANITY_BENCH_INFLIGHT") {
             config.inflight = value.parse().context("invalid benchmark inflight")?;
+        }
+        if let Ok(value) = std::env::var("VANITY_BENCH_CHUNK") {
+            config.chunk = value.parse().context("invalid benchmark chunk")?;
+        } else if config.invert {
+            // Threadgroup inversion excludes the default chunked inversion.
+            config.chunk = 0;
         }
         config.validate()?;
         Ok(config)
@@ -251,6 +272,7 @@ pub(crate) struct MetalBackend {
     pipeline: Object<dyn MTLComputePipelineState>,
     jacobian: Option<Object<dyn MTLComputePipelineState>>,
     invert_pipeline: Option<Object<dyn MTLComputePipelineState>>,
+    chunk_pipeline: Option<Object<dyn MTLComputePipelineState>>,
     slots: Vec<GpuSlot>,
     collect_at: usize,
     pending: usize,
@@ -277,11 +299,13 @@ impl MetalBackend {
                 return Ok(None);
             };
             let mut source = format!(
-                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n{}",
+                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n{}",
                 u8::from(config.square),
                 u8::from(config.fast_add),
                 u8::from(config.invert),
                 config.window_bits,
+                config.chunk,
+                u8::from(config.keccak),
                 include_str!("shader.metal")
             );
             // Diagnostic entry points are not included in production binaries.
@@ -293,24 +317,26 @@ impl MetalBackend {
                 .map_err(|error| anyhow!("Metal shader compilation failed: {error}"))?;
             let pipeline =
                 pipeline_with_group(&device, &library, "derive_addresses", config.group)?;
-            let (jacobian, invert_pipeline) = if config.invert {
-                (
-                    Some(pipeline_with_group(
+            let split = config.invert || config.chunk > 0;
+            let jacobian = split
+                .then(|| pipeline_with_group(&device, &library, "jacobian_points", config.group))
+                .transpose()?;
+            let invert_pipeline = config
+                .invert
+                .then(|| {
+                    pipeline_with_group(&device, &library, "invert_affine_keccak", config.group)
+                })
+                .transpose()?;
+            let chunk_pipeline = (config.chunk > 0)
+                .then(|| {
+                    pipeline_with_group(
                         &device,
                         &library,
-                        "jacobian_points",
+                        "chunk_invert_affine_keccak",
                         config.group,
-                    )?),
-                    Some(pipeline_with_group(
-                        &device,
-                        &library,
-                        "invert_affine_keccak",
-                        config.group,
-                    )?),
-                )
-            } else {
-                (None, None)
-            };
+                    )
+                })
+                .transpose()?;
             let queue = device
                 .newCommandQueue()
                 .context("Metal command queue unavailable")?;
@@ -322,8 +348,7 @@ impl MetalBackend {
                 slots.push(GpuSlot {
                     input: SharedBuffer::new(&device, capacity * 32, true)?,
                     output: SharedBuffer::new(&device, capacity * 20, false)?,
-                    xyz: config
-                        .invert
+                    xyz: split
                         .then(|| SharedBuffer::new(&device, capacity * 96, false))
                         .transpose()?,
                     command: None,
@@ -337,6 +362,7 @@ impl MetalBackend {
                 pipeline,
                 jacobian,
                 invert_pipeline,
+                chunk_pipeline,
                 slots,
                 collect_at: 0,
                 pending: 0,
@@ -443,31 +469,63 @@ fn table_bytes(window_bits: u8) -> usize {
 }
 
 fn populate_table(table: &mut SharedBuffer, secp: &Secp256k1<All>, window_bits: u8) -> Result<()> {
+    let bytes = build_table(secp, window_bits)?;
     table.clear();
-    let windows = 256 / window_bits as usize;
-    let radix = 1u32 << window_bits;
-    for window in 0..windows {
-        for digit in 1..radix {
-            // Public constants, not wallet keys: digit * 2^(window_bits*window) * G.
-            let mut scalar = [0; 32];
-            if window_bits == 4 {
-                scalar[31 - window / 2] = (digit as u8) << ((window % 2) * 4);
-            } else {
-                scalar[31 - window] = digit as u8;
-            }
-            let key = SecretKey::from_byte_array(scalar)?;
-            let public = PublicKey::from_secret_key(secp, &key).serialize_uncompressed();
-            let offset = (window * radix as usize + digit as usize) * 64;
-            for coordinate in 0..2 {
-                for limb in 0..8 {
-                    let start = 1 + coordinate * 32 + (7 - limb) * 4;
-                    let word = u32::from_be_bytes(public[start..start + 4].try_into().unwrap());
-                    table.write(offset + coordinate * 32 + limb * 4, &word.to_le_bytes());
-                }
-            }
+    table.write(0, &bytes);
+    Ok(())
+}
+
+/// Uncompressed affine X||Y as little-endian u32 limbs, matching load order in
+/// shader.metal. These are public fixed-base constants, not wallet keys.
+fn write_table_entry(slot: &mut [u8], public: &PublicKey) {
+    let public = public.serialize_uncompressed();
+    for coordinate in 0..2 {
+        for limb in 0..8 {
+            let start = 1 + coordinate * 32 + (7 - limb) * 4;
+            let word = u32::from_be_bytes(public[start..start + 4].try_into().unwrap());
+            slot[coordinate * 32 + limb * 4..][..4].copy_from_slice(&word.to_le_bytes());
         }
     }
-    Ok(())
+}
+
+/// Table entry `(window, digit)` holds `digit * 2^(window_bits*window) * G`;
+/// digit 0 stays zero. Entries are built incrementally (one point addition per
+/// digit) instead of one full scalar multiplication each: at 16-bit windows the
+/// 1M-entry table would otherwise dominate startup. Windows are independent
+/// and fill in parallel.
+fn build_table(secp: &Secp256k1<All>, window_bits: u8) -> Result<Vec<u8>> {
+    let windows = 256 / window_bits as usize;
+    let radix = 1usize << window_bits;
+    let mut bytes = vec![0u8; table_bytes(window_bits)];
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::with_capacity(windows);
+        for (window, slice) in bytes.chunks_mut(radix * 64).enumerate() {
+            workers.push(scope.spawn(move || -> Result<()> {
+                let bit = window_bits as usize * window;
+                let mut scalar = [0; 32];
+                scalar[31 - bit / 8] = 1 << (bit % 8);
+                let base = PublicKey::from_secret_key(secp, &SecretKey::from_byte_array(scalar)?);
+                let mut entry = base;
+                for digit in 1..radix {
+                    write_table_entry(&mut slice[digit * 64..(digit + 1) * 64], &entry);
+                    if digit + 1 < radix {
+                        // digit*B + B < n*B: the sum can never hit infinity.
+                        entry = entry
+                            .combine(&base)
+                            .map_err(|_| anyhow!("table point addition failed"))?;
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow!("table builder panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(bytes)
 }
 
 fn write_keys(input: &mut SharedBuffer, keys: &[SecretKey], bulk: bool) {
@@ -518,13 +576,19 @@ fn upload_keys_bulk<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> Secr
 
 /// Buffer layouts are defined together with shader.metal: raw 32-byte big-endian
 /// scalars, LE u32 table limbs, packed 20-byte addresses, and a copied u32 count.
+/// `threads` is the dispatch width; chunked kernels use fewer threads than items.
 fn encode_compute(
     command: &ProtocolObject<dyn MTLCommandBuffer>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     buffers: (&SharedBuffer, &SharedBuffer, &SharedBuffer),
     count: usize,
+    threads: usize,
     group: Option<usize>,
 ) -> Result<()> {
+    ensure!(
+        threads > 0 && threads <= count,
+        "invalid Metal dispatch width"
+    );
     let (input, table, output) = buffers;
     let encoder = command
         .computeCommandEncoder()
@@ -557,7 +621,7 @@ fn encode_compute(
     );
     encoder.dispatchThreads_threadsPerThreadgroup(
         MTLSize {
-            width: count as usize,
+            width: threads,
             height: 1,
             depth: 1,
         },
@@ -588,7 +652,7 @@ fn dispatch<O: Observer>(
         command,
         submitted: false,
     };
-    encode_compute(&completion.command, pipeline, buffers, count, group)?;
+    encode_compute(&completion.command, pipeline, buffers, count, count, group)?;
     completion.complete(observer, encoded)
 }
 
@@ -656,31 +720,40 @@ impl MetalBackend {
                 submitted: false,
             };
             let slot = &self.slots[submit_at];
-            if invert {
+            let chunk = self.config.chunk as usize;
+            if invert || chunk > 0 {
                 let jacobian = self
                     .jacobian
                     .as_ref()
-                    .context("invert path missing jacobian pipeline")?;
-                let invert_pipeline = self
-                    .invert_pipeline
-                    .as_ref()
-                    .context("invert path missing invert pipeline")?;
-                let xyz = slot
-                    .xyz
-                    .as_ref()
-                    .context("invert path missing XYZ buffer")?;
+                    .context("split path missing jacobian pipeline")?;
+                let xyz = slot.xyz.as_ref().context("split path missing XYZ buffer")?;
                 encode_compute(
                     &completion.command,
                     jacobian,
                     (&slot.input, &self.table, xyz),
                     keys.len(),
+                    keys.len(),
                     group,
                 )?;
+                let (second, threads) = if invert {
+                    let pipeline = self
+                        .invert_pipeline
+                        .as_ref()
+                        .context("invert path missing invert pipeline")?;
+                    (pipeline, keys.len())
+                } else {
+                    let pipeline = self
+                        .chunk_pipeline
+                        .as_ref()
+                        .context("chunk path missing chunk pipeline")?;
+                    (pipeline, keys.len().div_ceil(chunk))
+                };
                 encode_compute(
                     &completion.command,
-                    invert_pipeline,
+                    second,
                     (xyz, &self.table, &slot.output),
                     keys.len(),
+                    threads,
                     group,
                 )?;
             } else {
@@ -688,6 +761,7 @@ impl MetalBackend {
                     &completion.command,
                     &self.pipeline,
                     (&slot.input, &self.table, &slot.output),
+                    keys.len(),
                     keys.len(),
                     group,
                 )?;
@@ -916,19 +990,74 @@ mod tests {
     }
 
     #[test]
-    fn metal_config_rejects_invalid_window_and_inflight() {
+    fn metal_config_rejects_invalid_window_inflight_and_chunk() {
         let mut invalid = MetalConfig {
             window_bits: 5,
             ..MetalConfig::default()
         };
         assert!(invalid.validate().is_err());
-        invalid.window_bits = 4;
+        invalid.window_bits = 16;
+        assert!(invalid.validate().is_ok());
         invalid.inflight = 3;
         assert!(invalid.validate().is_err());
         invalid.inflight = 1;
+        invalid.chunk = 3;
+        assert!(invalid.validate().is_err());
+        invalid.chunk = 8;
+        invalid.invert = true;
+        assert!(invalid.validate().is_err());
+        invalid.invert = false;
         assert!(invalid.validate().is_ok());
         assert_eq!(table_bytes(4), 64 * 16 * 64);
         assert_eq!(table_bytes(8), 32 * 256 * 64);
+        assert_eq!(table_bytes(16), 16 * 65536 * 64);
+    }
+
+    #[test]
+    fn incremental_table_matches_scalar_multiplication() -> Result<()> {
+        let secp = Secp256k1::new();
+        let mut rng = ChaCha20Rng::from_seed([71; 32]);
+        for window_bits in [4u8, 8, 16] {
+            let table = build_table(&secp, window_bits)?;
+            assert_eq!(table.len(), table_bytes(window_bits));
+            let windows = 256 / window_bits as usize;
+            let radix = 1usize << window_bits;
+            for window in 0..windows {
+                assert!(
+                    table[window * radix * 64..window * radix * 64 + 64]
+                        .iter()
+                        .all(|&byte| byte == 0),
+                    "window {window} digit 0 must stay zero"
+                );
+                // Small radices verify every digit; 16-bit spot-checks borders
+                // plus random digits (a full check would be 1M scalar mults).
+                let mut digits = vec![1, 2, radix / 2, radix - 2, radix - 1];
+                if window_bits == 16 {
+                    for _ in 0..6 {
+                        digits.push(1 + (rng.next_u32() as usize) % (radix - 1));
+                    }
+                } else {
+                    digits.extend(3..radix - 2);
+                }
+                for digit in digits {
+                    let value = num_bigint::BigUint::from(digit) << (window_bits as usize * window);
+                    let mut scalar = [0; 32];
+                    let big_endian = value.to_bytes_be();
+                    scalar[32 - big_endian.len()..].copy_from_slice(&big_endian);
+                    let public =
+                        PublicKey::from_secret_key(&secp, &SecretKey::from_byte_array(scalar)?);
+                    let mut expected = [0; 64];
+                    write_table_entry(&mut expected, &public);
+                    let offset = (window * radix + digit) * 64;
+                    assert_eq!(
+                        &table[offset..offset + 64],
+                        &expected[..],
+                        "window {window} digit {digit} ({window_bits}-bit)"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -997,6 +1126,59 @@ mod tests {
                     "GPU secret buffer not cleared"
                 );
                 eprintln!("GPU differential batch {count}: passed");
+            }
+            // Structural variants around the defaults (chunk 8, 16-bit
+            // windows): the unchunked single-kernel path, both chunk sizes,
+            // every window width, and interleaved Keccak. Chunk tails are
+            // covered by counts that are not multiples of 4 or 8.
+            let candidates = [
+                MetalConfig {
+                    chunk: 0,
+                    window_bits: 8,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 4,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 8,
+                    window_bits: 8,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 8,
+                    window_bits: 4,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    keccak: true,
+                    ..MetalConfig::default()
+                },
+            ];
+            for (which, config) in candidates.into_iter().enumerate() {
+                let mut candidate = MetalBackend::with_config(4099, config)?
+                    .context("GPU required for hardware acceptance")?;
+                for &count in &[1usize, 33, 129, 4095, 4099] {
+                    let mut addresses = vec![[0; 20]; count];
+                    candidate.derive_batch(&keys[..count], &mut addresses)?;
+                    for index in 0..count {
+                        assert_eq!(
+                            addresses[index],
+                            cpu::derive_address(&keys[index], &candidate.verifier),
+                            "candidate {which} address case {index}, batch {count}"
+                        );
+                    }
+                }
+                for (slot_index, slot) in candidate.slots.iter().enumerate() {
+                    let mut cleared = vec![1; slot.input.object.length()];
+                    slot.input.read(0, &mut cleared);
+                    assert!(
+                        cleared.iter().all(|&byte| byte == 0),
+                        "candidate {which} slot {slot_index} secret buffer not cleared"
+                    );
+                }
+                eprintln!("GPU candidate config {which}: passed");
             }
             assert!(backend.derive_batch(&keys[..1], &mut []).is_err());
             keys.push(keys[0]);
