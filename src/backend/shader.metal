@@ -1,6 +1,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef OPT_INVERT
+#define OPT_INVERT 0
+#endif
+#ifndef WINDOW_BITS
+#define WINDOW_BITS 4
+#endif
+
 // Little-endian 32-bit limbs, canonical modulo p = 2^256 - 2^32 - 977.
 // All scalar-dependent choices below use masks, not branches or table indices.
 struct Fe { uint v[8]; };
@@ -217,32 +224,103 @@ inline Point add_window(Point a, Fe bx, Fe by, uint digit) {
     return point_select(out, a, mask_if(digit == 0));
 }
 
-inline Point public_point(device const uchar *key, device const uint *table) {
-    Point sum = {fe_zero(), fe_one(), fe_zero()};
-    for (uint window = 0; window < 64; ++window) {
-        uint digit = (uint(key[31 - window / 2]) >> ((window % 2) * 4)) & 15u;
-        Fe x = {}, y = {};
-        // Scan all entries. Memory addresses depend only on public loop indices.
-        for (uint entry = 0; entry < 16; ++entry) {
-            uint mask = mask_if(entry == digit);
-            uint offset = (window * 16 + entry) * 16;
-            for (uint limb = 0; limb < 8; ++limb) {
-                x.v[limb] |= table[offset + limb] & mask;
-                y.v[limb] |= table[offset + 8 + limb] & mask;
-            }
+inline void store_fe(device uint *out, Fe a) {
+    for (uint i = 0; i < 8; ++i) out[i] = a.v[i];
+}
+inline Fe load_fe(device const uint *in) {
+    Fe a;
+    for (uint i = 0; i < 8; ++i) a.v[i] = in[i];
+    return a;
+}
+inline void tg_store(threadgroup uint *slot, Fe a) {
+    for (uint i = 0; i < 8; ++i) slot[i] = a.v[i];
+}
+inline Fe tg_load(threadgroup const uint *slot) {
+    Fe a;
+    for (uint i = 0; i < 8; ++i) a.v[i] = slot[i];
+    return a;
+}
+
+// 4-bit windows: scan every table entry so addresses depend only on public
+// loop indices. 8-bit windows cannot scan 256 entries; digit indexes the row
+// (secret-dependent address, a performance choice, not constant-time scanning).
+inline void window_point(device const uchar *key, device const uint *table,
+                         uint window, thread Fe &x, thread Fe &y, thread uint &digit) {
+    x = fe_zero();
+    y = fe_zero();
+#if WINDOW_BITS == 8
+    digit = uint(key[31 - window]);
+    uint offset = (window * 256u + digit) * 16u;
+    for (uint limb = 0; limb < 8; ++limb) {
+        x.v[limb] = table[offset + limb];
+        y.v[limb] = table[offset + 8 + limb];
+    }
+#else
+    digit = (uint(key[31 - window / 2]) >> ((window % 2) * 4)) & 15u;
+    for (uint entry = 0; entry < 16; ++entry) {
+        uint mask = mask_if(entry == digit);
+        uint offset = (window * 16 + entry) * 16;
+        for (uint limb = 0; limb < 8; ++limb) {
+            x.v[limb] |= table[offset + limb] & mask;
+            y.v[limb] |= table[offset + 8 + limb] & mask;
         }
+    }
+#endif
+}
+
+inline Point public_jacobian(device const uchar *key, device const uint *table) {
+    Point sum = {fe_zero(), fe_one(), fe_zero()};
+    for (uint window = 0; window < (256u / WINDOW_BITS); ++window) {
+        Fe x, y;
+        uint digit;
+        window_point(key, table, window, x, y, digit);
         // Inputs are host-validated scalars 0<k<n. Nonzero windows are disjoint
         // positive scalar terms; partial sums never reach n. Thus a finite sum
         // cannot equal or negate the next window point (the h=0 exceptions).
         // Infinity/zero digits are handled with masks in add_window.
         sum = add_window(sum, x, y, digit);
     }
+    return sum;
+}
+
+inline Point to_affine(Point sum) {
     Fe inverse = fe_inverse(sum.z);
     Fe inverse2 = fe_square(inverse);
     sum.x = fe_mul(sum.x, inverse2);
     sum.y = fe_mul(sum.y, fe_mul(inverse2, inverse));
     sum.z = fe_one();
     return sum;
+}
+
+inline Point public_point(device const uchar *key, device const uint *table) {
+    return to_affine(public_jacobian(key, table));
+}
+
+// Replace a zero Z with 1 so the threadgroup product stays invertible, then
+// restore a zero inverse. Inactive (padding) lanes also pass Z=1.
+inline Fe montgomery_threadgroup_inverse(
+    Fe z, uint lid, uint n,
+    threadgroup uint *zs, threadgroup uint *prefix, threadgroup uint *inverses) {
+    uint z_zero = fe_zero_mask(z);
+    Fe z_work = fe_select(z, fe_one(), z_zero);
+    tg_store(zs + lid * 8, z_work);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+        Fe acc = tg_load(zs);
+        tg_store(prefix, acc);
+        for (uint i = 1; i < n; ++i) {
+            acc = fe_mul(acc, tg_load(zs + i * 8));
+            tg_store(prefix + i * 8, acc);
+        }
+        Fe inv = fe_inverse(acc);
+        for (uint i = n; i-- > 0; ) {
+            Fe prev = i == 0 ? fe_one() : tg_load(prefix + (i - 1) * 8);
+            tg_store(inverses + i * 8, fe_mul(inv, prev));
+            inv = fe_mul(inv, tg_load(zs + i * 8));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return fe_select(tg_load(inverses + lid * 8), fe_zero(), z_zero);
 }
 inline uchar coordinate_byte(Fe a, uint index) {
     return uchar(a.v[7 - index / 4] >> ((3 - index % 4) * 8));
@@ -292,4 +370,45 @@ kernel void derive_addresses(device const uchar *keys [[buffer(0)]],
                              uint gid [[thread_position_in_grid]]) {
     if (gid >= count) return; // public batch boundary
     eth_address(public_point(keys + gid*32, table), addresses + gid*20);
+}
+
+kernel void jacobian_points(device const uchar *keys [[buffer(0)]],
+                            device const uint *table [[buffer(1)]],
+                            device uint *xyz [[buffer(2)]],
+                            constant uint &count [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    Point p = public_jacobian(keys + gid * 32, table);
+    device uint *slot = xyz + gid * 24;
+    store_fe(slot, p.x);
+    store_fe(slot + 8, p.y);
+    store_fe(slot + 16, p.z);
+}
+
+kernel void invert_affine_keccak(device const uint *xyz [[buffer(0)]],
+                                 device const uint *unused [[buffer(1)]],
+                                 device uchar *addresses [[buffer(2)]],
+                                 constant uint &count [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]],
+                                 uint lid [[thread_index_in_threadgroup]],
+                                 uint tpg [[threads_per_threadgroup]]) {
+    (void)unused;
+    threadgroup uint zs[256 * 8];
+    threadgroup uint prefix[256 * 8];
+    threadgroup uint inverses[256 * 8];
+    bool active = gid < count;
+    Fe z = fe_one();
+    Fe x = fe_zero();
+    Fe y = fe_zero();
+    if (active) {
+        device const uint *slot = xyz + gid * 24;
+        x = load_fe(slot);
+        y = load_fe(slot + 8);
+        z = load_fe(slot + 16);
+    }
+    Fe z_inv = montgomery_threadgroup_inverse(z, lid, tpg, zs, prefix, inverses);
+    if (!active) return;
+    Fe inverse2 = fe_square(z_inv);
+    Point point = {fe_mul(x, inverse2), fe_mul(y, fe_mul(inverse2, z_inv)), fe_one()};
+    eth_address(point, addresses + gid * 20);
 }

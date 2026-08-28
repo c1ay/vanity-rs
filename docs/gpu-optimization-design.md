@@ -27,10 +27,22 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 ## 有界准备流水线
 
-一个准备线程与一个 GPU 调度线程共用两份通过所有权转移的主机私钥批次。准备队列容量 1，回收队列容量 2；Metal 仍只有一套输入输出缓冲区、最多一个在途命令。私钥批次不实现 `Clone` 或 `Debug`。
+一个准备线程与一个 GPU 调度线程共用两份通过所有权转移的主机私钥批次。准备队列容量 1，回收队列容量 2。私钥批次不实现 `Clone` 或 `Debug`。
 
-准备线程使用独立的 `OsRng → ChaCha20Rng` 和合法标量拒绝采样，每生成 1024 项检查取消；队列发送和接收最多等待 10ms 就检查取消。批次序号按 FIFO 验证，匹配和复核完成后才回收存储。
+准备线程使用独立的 `OsRng → ChaCha20Rng` 和合法标量拒绝采样，每生成 1024 项检查取消；队列发送和接收最多等待 10ms 就检查取消。批次序号按 FIFO 验证。搜索在 GPU 完成并匹配/复核后才回收该份存储；双在途时 `begin_batch` 之后立即回收准备队列中的那份，因为搜索循环持有私钥副本直到 `end_batch`。
 
 只统计成功推导的完整批次；提前准备但未提交的私钥不计数。停止期间完成的在途批次仍计数。准备失败、GPU 错误、校验失败、写盘失败或线程异常都会取消搜索。消费者暂存命中，等待准备线程加入后才返回；准备线程的错误或 panic 优先于命中。消费者 unwind 的取消守卫先于 scope 隐式 join 执行，避免后台线程滞留。
 
 普通测试覆盖 FIFO 和两份存储复用、队列取消、未提交批次计数、空匹配/奇数长度/重叠条件、生成失败、生产者及消费者 panic、计算及复核错误，以及命中与随后错误并发的优先级。实际 GPU 测试覆盖运算、整批读写、尾批、容量上限和清理路径；实际 CLI 验证持久化错误与输出兼容。
+
+## 线程组 Montgomery 求逆
+
+`public_jacobian` 写出每点 96 字节的 `X||Y||Z`。`invert_affine_keccak` 在 threadgroup 内做 Montgomery 乘积求逆（零 Z 先换成 1，再把逆元清零），然后仿射化并做 Keccak。尾组使用 `threads_per_threadgroup`，静态数组上限 256。`derive_batch` 仍同步：两个 compute encoder 落在同一 command buffer 上一次等待。该路径通过差分测试，但持续吞吐低于每地址一次 `fe_inverse`，默认关闭（`VANITY_BENCH_INVERT`）。
+
+## 8-bit 固定基窗口
+
+表大小为 `windows * radix * 64` 字节。4-bit 仍扫描 16 项，地址只依赖公开循环下标。8-bit 按 digit 索引，`offset = (window * 256 + digit) * 16`；digit 进入地址，这是性能选择。主机用 `digit * 2^(window_bits*window) * G` 填表，digit 0 保持零。默认 `WINDOW_BITS=8`。
+
+## 双在途 GPU 命令
+
+`AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。

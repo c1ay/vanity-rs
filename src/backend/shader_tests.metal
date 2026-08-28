@@ -24,3 +24,19 @@ kernel void field_operations(device const uint *input [[buffer(0)]],
     for (uint op = 0; op < 5; ++op)
         for (uint i = 0; i < 8; ++i) output[gid*40+op*8+i] = values[op].v[i];
 }
+
+kernel void threadgroup_invert(device const uint *input [[buffer(0)]],
+                               device const uint *unused [[buffer(1)]],
+                               device uint *output [[buffer(2)]],
+                               constant uint &count [[buffer(3)]],
+                               uint gid [[thread_position_in_grid]],
+                               uint lid [[thread_index_in_threadgroup]],
+                               uint tpg [[threads_per_threadgroup]]) {
+    (void)unused;
+    threadgroup uint zs[256 * 8];
+    threadgroup uint prefix[256 * 8];
+    threadgroup uint inverses[256 * 8];
+    Fe z = gid < count ? load_fe(input + gid * 8) : fe_one();
+    Fe z_inv = montgomery_threadgroup_inverse(z, lid, tpg, zs, prefix, inverses);
+    if (gid < count) store_fe(output + gid * 8, z_inv);
+}

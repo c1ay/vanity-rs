@@ -18,14 +18,47 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{Address, AddressBackend, cpu};
 use crate::timing::{Noop, Observer, Stage};
 
-// Experiments remain available only to the test harness. The buffer, threadgroup
-// and arithmetic candidates did not demonstrate the required stable gain.
-#[derive(Clone, Copy, Default)]
+// Experiments remain available only to the test harness. Arithmetic and
+// threadgroup candidates from the previous round stay off. Threadgroup
+// Montgomery invert was measured and rejected. 8-bit windows and two
+// in-flight GPU commands passed the retention gate and are the defaults.
+#[derive(Clone, Copy)]
 pub(crate) struct MetalConfig {
     pub(crate) bulk: bool,
     pub(crate) group: Option<usize>,
     pub(crate) square: bool,
     pub(crate) fast_add: bool,
+    pub(crate) invert: bool,
+    pub(crate) window_bits: u8,
+    pub(crate) inflight: u8,
+}
+
+impl Default for MetalConfig {
+    fn default() -> Self {
+        Self {
+            bulk: false,
+            group: None,
+            square: false,
+            fast_add: false,
+            invert: false,
+            window_bits: 8,
+            inflight: 2,
+        }
+    }
+}
+
+impl MetalConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.window_bits == 4 || self.window_bits == 8,
+            "VANITY_BENCH_WINDOW must be 4 or 8"
+        );
+        ensure!(
+            self.inflight == 1 || self.inflight == 2,
+            "VANITY_BENCH_INFLIGHT must be 1 or 2"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -36,6 +69,7 @@ impl MetalConfig {
             ("VANITY_BENCH_BULK", &mut config.bulk),
             ("VANITY_BENCH_SQUARE", &mut config.square),
             ("VANITY_BENCH_ADD", &mut config.fast_add),
+            ("VANITY_BENCH_INVERT", &mut config.invert),
         ] {
             if let Ok(value) = std::env::var(name) {
                 *setting = match value.as_str() {
@@ -52,6 +86,13 @@ impl MetalConfig {
                 Some(value.parse().context("invalid benchmark group")?)
             };
         }
+        if let Ok(value) = std::env::var("VANITY_BENCH_WINDOW") {
+            config.window_bits = value.parse().context("invalid benchmark window")?;
+        }
+        if let Ok(value) = std::env::var("VANITY_BENCH_INFLIGHT") {
+            config.inflight = value.parse().context("invalid benchmark inflight")?;
+        }
+        config.validate()?;
         Ok(config)
     }
 }
@@ -135,8 +176,10 @@ impl Drop for SharedBuffer {
     }
 }
 
+#[cfg(test)]
 struct SecretUpload<'a>(&'a mut SharedBuffer);
 
+#[cfg(test)]
 impl Drop for SecretUpload<'_> {
     fn drop(&mut self) {
         self.0.clear();
@@ -148,17 +191,22 @@ struct CommandCompletion {
     submitted: bool,
 }
 
+// SAFETY: the backend never shares a live command buffer. CPU waits or Drop
+// complete GPU work before the slot is reused or moved to another thread.
+unsafe impl Send for CommandCompletion {}
+
 impl CommandCompletion {
-    fn complete<O: Observer>(mut self, observer: &O, encoded: O::Stamp) -> Result<()> {
+    fn commit<O: Observer>(&mut self, observer: &O, encoded: O::Stamp) {
         self.command.commit();
         self.submitted = true;
         observer.finish(Stage::EncodeSubmit, encoded);
+    }
+
+    fn wait<O: Observer>(mut self, observer: &O) -> Result<()> {
         let waiting = observer.start();
         self.command.waitUntilCompleted();
         self.submitted = false;
         observer.finish(Stage::Wait, waiting);
-        // Noop ignores these values, but avoid even Objective-C timestamp calls
-        // in normal execution through the observer's static profiling flag.
         if O::ENABLED {
             observer.gpu_seconds(self.command.GPUStartTime(), self.command.GPUEndTime());
         }
@@ -172,6 +220,12 @@ impl CommandCompletion {
         );
         Ok(())
     }
+
+    #[cfg(test)]
+    fn complete<O: Observer>(mut self, observer: &O, encoded: O::Stamp) -> Result<()> {
+        self.commit(observer, encoded);
+        self.wait(observer)
+    }
 }
 
 impl Drop for CommandCompletion {
@@ -182,14 +236,24 @@ impl Drop for CommandCompletion {
     }
 }
 
+struct GpuSlot {
+    input: SharedBuffer,
+    output: SharedBuffer,
+    xyz: Option<SharedBuffer>,
+    command: Option<CommandCompletion>,
+}
+
 pub(crate) struct MetalBackend {
     device: Object<dyn MTLDevice>,
     queue: Object<dyn MTLCommandQueue>,
     #[cfg(test)]
     library: Object<dyn MTLLibrary>,
     pipeline: Object<dyn MTLComputePipelineState>,
-    input: SharedBuffer,
-    output: SharedBuffer,
+    jacobian: Option<Object<dyn MTLComputePipelineState>>,
+    invert_pipeline: Option<Object<dyn MTLComputePipelineState>>,
+    slots: Vec<GpuSlot>,
+    collect_at: usize,
+    pending: usize,
     table: SharedBuffer,
     capacity: usize,
     sample_index: usize,
@@ -207,14 +271,17 @@ impl MetalBackend {
             (1..=super::MAX_GPU_BATCH_SIZE as usize).contains(&capacity),
             "invalid Metal batch capacity"
         );
+        config.validate()?;
         autoreleasepool(|_| {
             let Some(device) = MTLCreateSystemDefaultDevice() else {
                 return Ok(None);
             };
             let mut source = format!(
-                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n{}",
+                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n{}",
                 u8::from(config.square),
                 u8::from(config.fast_add),
+                u8::from(config.invert),
+                config.window_bits,
                 include_str!("shader.metal")
             );
             // Diagnostic entry points are not included in production binaries.
@@ -226,22 +293,53 @@ impl MetalBackend {
                 .map_err(|error| anyhow!("Metal shader compilation failed: {error}"))?;
             let pipeline =
                 pipeline_with_group(&device, &library, "derive_addresses", config.group)?;
+            let (jacobian, invert_pipeline) = if config.invert {
+                (
+                    Some(pipeline_with_group(
+                        &device,
+                        &library,
+                        "jacobian_points",
+                        config.group,
+                    )?),
+                    Some(pipeline_with_group(
+                        &device,
+                        &library,
+                        "invert_affine_keccak",
+                        config.group,
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
             let queue = device
                 .newCommandQueue()
                 .context("Metal command queue unavailable")?;
             let verifier = Secp256k1::new();
-            let mut table = SharedBuffer::new(&device, 64 * 16 * 64, false)?;
-            populate_table(&mut table, &verifier)?;
-            let input = SharedBuffer::new(&device, capacity * 32, true)?;
-            let output = SharedBuffer::new(&device, capacity * 20, false)?;
+            let mut table = SharedBuffer::new(&device, table_bytes(config.window_bits), false)?;
+            populate_table(&mut table, &verifier, config.window_bits)?;
+            let mut slots = Vec::with_capacity(config.inflight as usize);
+            for _ in 0..config.inflight {
+                slots.push(GpuSlot {
+                    input: SharedBuffer::new(&device, capacity * 32, true)?,
+                    output: SharedBuffer::new(&device, capacity * 20, false)?,
+                    xyz: config
+                        .invert
+                        .then(|| SharedBuffer::new(&device, capacity * 96, false))
+                        .transpose()?,
+                    command: None,
+                });
+            }
             let mut backend = Self {
                 device,
                 queue,
                 #[cfg(test)]
                 library,
                 pipeline,
-                input,
-                output,
+                jacobian,
+                invert_pipeline,
+                slots,
+                collect_at: 0,
+                pending: 0,
                 table,
                 capacity,
                 sample_index: 0,
@@ -279,6 +377,15 @@ impl MetalBackend {
         }
         self.sample_index = 0;
         Ok(())
+    }
+}
+
+impl Drop for MetalBackend {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            slot.command.take();
+            slot.input.clear();
+        }
     }
 }
 
@@ -329,16 +436,28 @@ fn pipeline_with_group(
     Ok(result)
 }
 
-fn populate_table(table: &mut SharedBuffer, secp: &Secp256k1<All>) -> Result<()> {
+fn table_bytes(window_bits: u8) -> usize {
+    let windows = 256 / window_bits as usize;
+    let radix = 1usize << window_bits;
+    windows * radix * 64
+}
+
+fn populate_table(table: &mut SharedBuffer, secp: &Secp256k1<All>, window_bits: u8) -> Result<()> {
     table.clear();
-    for window in 0..64 {
-        for digit in 1..16 {
-            // Public constants, not wallet keys: digit * 16^window * G.
+    let windows = 256 / window_bits as usize;
+    let radix = 1u32 << window_bits;
+    for window in 0..windows {
+        for digit in 1..radix {
+            // Public constants, not wallet keys: digit * 2^(window_bits*window) * G.
             let mut scalar = [0; 32];
-            scalar[31 - window / 2] = (digit as u8) << ((window % 2) * 4);
+            if window_bits == 4 {
+                scalar[31 - window / 2] = (digit as u8) << ((window % 2) * 4);
+            } else {
+                scalar[31 - window] = digit as u8;
+            }
             let key = SecretKey::from_byte_array(scalar)?;
             let public = PublicKey::from_secret_key(secp, &key).serialize_uncompressed();
-            let offset = (window * 16 + digit) * 64;
+            let offset = (window * radix as usize + digit as usize) * 64;
             for coordinate in 0..2 {
                 for limb in 0..8 {
                     let start = 1 + coordinate * 32 + (7 - limb) * 4;
@@ -351,6 +470,27 @@ fn populate_table(table: &mut SharedBuffer, secp: &Secp256k1<All>) -> Result<()>
     Ok(())
 }
 
+fn write_keys(input: &mut SharedBuffer, keys: &[SecretKey], bulk: bool) {
+    if bulk {
+        let bytes = keys
+            .len()
+            .checked_mul(32)
+            .expect("key upload length overflow");
+        input.with_bytes_mut(bytes, |destination| {
+            for (slot, key) in destination.chunks_exact_mut(32).zip(keys) {
+                let bytes = Zeroizing::new(key.secret_bytes());
+                slot.copy_from_slice(bytes.as_ref());
+            }
+        });
+    } else {
+        for (index, key) in keys.iter().enumerate() {
+            let bytes = Zeroizing::new(key.secret_bytes());
+            input.write(index * 32, bytes.as_ref());
+        }
+    }
+}
+
+#[cfg(test)]
 fn upload_keys<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> SecretUpload<'a> {
     let upload = SecretUpload(input);
     for (index, key) in keys.iter().enumerate() {
@@ -360,6 +500,7 @@ fn upload_keys<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> SecretUpl
     upload
 }
 
+#[cfg(test)]
 fn upload_keys_bulk<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> SecretUpload<'a> {
     let upload = SecretUpload(input);
     let bytes = keys
@@ -377,25 +518,15 @@ fn upload_keys_bulk<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> Secr
 
 /// Buffer layouts are defined together with shader.metal: raw 32-byte big-endian
 /// scalars, LE u32 table limbs, packed 20-byte addresses, and a copied u32 count.
-fn dispatch<O: Observer>(
-    queue: &ProtocolObject<dyn MTLCommandQueue>,
+fn encode_compute(
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     buffers: (&SharedBuffer, &SharedBuffer, &SharedBuffer),
     count: usize,
     group: Option<usize>,
-    observer: &O,
 ) -> Result<()> {
     let (input, table, output) = buffers;
-    let encoded = observer.start();
-    let command = queue
-        .commandBuffer()
-        .context("Metal command buffer unavailable")?;
-    let completion = CommandCompletion {
-        command,
-        submitted: false,
-    };
-    let encoder = completion
-        .command
+    let encoder = command
         .computeCommandEncoder()
         .context("Metal compute encoder unavailable")?;
     encoder.setComputePipelineState(pipeline);
@@ -421,7 +552,7 @@ fn dispatch<O: Observer>(
     );
     let group = group.unwrap_or_else(|| (128usize.max(width).min(max_threads) / width) * width);
     ensure!(
-        group > 0 && group <= max_threads && group % width == 0,
+        group > 0 && group <= max_threads && group <= 256 && group % width == 0,
         "invalid dispatch group"
     );
     encoder.dispatchThreads_threadsPerThreadgroup(
@@ -437,12 +568,45 @@ fn dispatch<O: Observer>(
         },
     );
     encoder.endEncoding();
+    Ok(())
+}
+
+#[cfg(test)]
+fn dispatch<O: Observer>(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    buffers: (&SharedBuffer, &SharedBuffer, &SharedBuffer),
+    count: usize,
+    group: Option<usize>,
+    observer: &O,
+) -> Result<()> {
+    let encoded = observer.start();
+    let command = queue
+        .commandBuffer()
+        .context("Metal command buffer unavailable")?;
+    let completion = CommandCompletion {
+        command,
+        submitted: false,
+    };
+    encode_compute(&completion.command, pipeline, buffers, count, group)?;
     completion.complete(observer, encoded)
 }
 
 impl AddressBackend for MetalBackend {
+    fn inflight_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
         self.derive_observed(keys, addresses, &Noop)
+    }
+
+    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
+        self.begin_observed(keys, &Noop)
+    }
+
+    fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
+        self.end_observed(keys, addresses, &Noop)
     }
 }
 
@@ -453,36 +617,116 @@ impl MetalBackend {
         addresses: &mut [Address],
         observer: &O,
     ) -> Result<()> {
-        ensure!(
-            keys.len() == addresses.len(),
-            "batch input/output lengths differ"
-        );
+        self.begin_observed(keys, observer)?;
+        self.end_observed(keys, addresses, observer)
+    }
+
+    pub(crate) fn begin_observed<O: Observer>(
+        &mut self,
+        keys: &[SecretKey],
+        observer: &O,
+    ) -> Result<()> {
         ensure!(keys.len() <= self.capacity, "batch exceeds Metal capacity");
+        ensure!(
+            self.pending < self.slots.len(),
+            "Metal in-flight slots exhausted"
+        );
         if keys.is_empty() {
             return Ok(());
         }
         autoreleasepool(|_| {
+            let submit_at = (self.collect_at + self.pending) % self.slots.len();
+            ensure!(
+                self.slots[submit_at].command.is_none(),
+                "Metal slot still holds an in-flight command"
+            );
+            let invert = self.config.invert;
+            let bulk = self.config.bulk;
+            let group = self.config.group;
             let uploaded = observer.start();
-            let upload = if self.config.bulk {
-                upload_keys_bulk(&mut self.input, keys)
-            } else {
-                upload_keys(&mut self.input, keys)
-            };
+            write_keys(&mut self.slots[submit_at].input, keys, bulk);
             observer.finish(Stage::Upload, uploaded);
-            dispatch(
-                &self.queue,
-                &self.pipeline,
-                (upload.0, &self.table, &self.output),
-                keys.len(),
-                self.config.group,
-                observer,
-            )?;
+            let encoded = observer.start();
+            let command = self
+                .queue
+                .commandBuffer()
+                .context("Metal command buffer unavailable")?;
+            let mut completion = CommandCompletion {
+                command,
+                submitted: false,
+            };
+            let slot = &self.slots[submit_at];
+            if invert {
+                let jacobian = self
+                    .jacobian
+                    .as_ref()
+                    .context("invert path missing jacobian pipeline")?;
+                let invert_pipeline = self
+                    .invert_pipeline
+                    .as_ref()
+                    .context("invert path missing invert pipeline")?;
+                let xyz = slot
+                    .xyz
+                    .as_ref()
+                    .context("invert path missing XYZ buffer")?;
+                encode_compute(
+                    &completion.command,
+                    jacobian,
+                    (&slot.input, &self.table, xyz),
+                    keys.len(),
+                    group,
+                )?;
+                encode_compute(
+                    &completion.command,
+                    invert_pipeline,
+                    (xyz, &self.table, &slot.output),
+                    keys.len(),
+                    group,
+                )?;
+            } else {
+                encode_compute(
+                    &completion.command,
+                    &self.pipeline,
+                    (&slot.input, &self.table, &slot.output),
+                    keys.len(),
+                    group,
+                )?;
+            }
+            completion.commit(observer, encoded);
+            self.slots[submit_at].command = Some(completion);
+            self.pending += 1;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn end_observed<O: Observer>(
+        &mut self,
+        keys: &[SecretKey],
+        addresses: &mut [Address],
+        observer: &O,
+    ) -> Result<()> {
+        ensure!(
+            keys.len() == addresses.len(),
+            "batch input/output lengths differ"
+        );
+        if keys.is_empty() {
+            return Ok(());
+        }
+        ensure!(self.pending > 0, "no in-flight Metal batch to collect");
+        autoreleasepool(|_| {
+            let collect_at = self.collect_at;
+            let command = self.slots[collect_at]
+                .command
+                .take()
+                .context("Metal slot missing in-flight command")?;
+            command.wait(observer)?;
+            let slot = &mut self.slots[collect_at];
             let read = observer.start();
             if self.config.bulk {
-                self.output.read(0, addresses.as_flattened_mut());
+                slot.output.read(0, addresses.as_flattened_mut());
             } else {
                 for (index, address) in addresses.iter_mut().enumerate() {
-                    self.output.read(index * 20, address);
+                    slot.output.read(index * 20, address);
                 }
             }
             observer.finish(Stage::ReadbackCleanup, read);
@@ -492,8 +736,10 @@ impl MetalBackend {
             self.sample_index = self.sample_index.wrapping_add(1);
             observer.finish(Stage::SampleVerify, verified);
             let cleared = observer.start();
-            drop(upload);
+            slot.input.clear();
             observer.finish(Stage::ReadbackCleanup, cleared);
+            self.collect_at = (collect_at + 1) % self.slots.len();
+            self.pending -= 1;
             Ok(())
         })
     }
@@ -523,7 +769,7 @@ mod tests {
         let output = SharedBuffer::new(&backend.device, keys.len().max(1) * 64, false)?;
         let mut public = vec![[0; 64]; keys.len()];
         if !keys.is_empty() {
-            let upload = upload_keys(&mut backend.input, keys);
+            let upload = upload_keys(&mut backend.slots[0].input, keys);
             dispatch(
                 &backend.queue,
                 &pipeline,
@@ -603,6 +849,88 @@ mod tests {
         Ok(())
     }
 
+    fn threadgroup_invert_differential(backend: &MetalBackend) -> Result<()> {
+        let p = (BigUint::from(1u8) << 256) - (BigUint::from(1u8) << 32) - BigUint::from(977u32);
+        let one = BigUint::from(1u8);
+        let pipeline = pipeline(&backend.device, &backend.library, "threadgroup_invert")?;
+        for &count in &[1usize, 129] {
+            let mut values = vec![one.clone(); count];
+            values[0] = &p - 1u8;
+            if count > 1 {
+                values[1] = one.clone();
+                for (index, slot) in values.iter_mut().enumerate().skip(2) {
+                    *slot = BigUint::from((index as u32) + 3) % &p;
+                    if slot == &0u8.into() {
+                        *slot = one.clone();
+                    }
+                }
+            }
+            let mut input = SharedBuffer::new(&backend.device, count * 32, false)?;
+            let output = SharedBuffer::new(&backend.device, count.max(1) * 32, false)?;
+            for (index, value) in values.iter().enumerate() {
+                let mut bytes = value.to_bytes_le();
+                bytes.resize(32, 0);
+                input.write(index * 32, &bytes);
+            }
+            dispatch(
+                &backend.queue,
+                &pipeline,
+                (&input, &backend.table, &output),
+                count,
+                None,
+                &Noop,
+            )?;
+            for (index, value) in values.iter().enumerate() {
+                let mut actual = [0; 32];
+                output.read(index * 32, &mut actual);
+                assert_eq!(
+                    BigUint::from_bytes_le(&actual),
+                    value.modpow(&(&p - 2u8), &p),
+                    "threadgroup invert case {index}, count {count}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn inflight_overlap_differential(backend: &mut MetalBackend, keys: &[SecretKey]) -> Result<()> {
+        ensure!(
+            backend.inflight_capacity() >= 2 && keys.len() >= 66,
+            "inflight overlap requires two slots"
+        );
+        let first = &keys[..33];
+        let second = &keys[33..66];
+        let mut out_first = vec![[0; 20]; first.len()];
+        let mut out_second = vec![[0; 20]; second.len()];
+        backend.begin_batch(first)?;
+        backend.begin_batch(second)?;
+        backend.end_batch(first, &mut out_first)?;
+        backend.end_batch(second, &mut out_second)?;
+        for (key, address) in first.iter().zip(&out_first) {
+            cpu::verify_address(key, address, &backend.verifier)?;
+        }
+        for (key, address) in second.iter().zip(&out_second) {
+            cpu::verify_address(key, address, &backend.verifier)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metal_config_rejects_invalid_window_and_inflight() {
+        let mut invalid = MetalConfig {
+            window_bits: 5,
+            ..MetalConfig::default()
+        };
+        assert!(invalid.validate().is_err());
+        invalid.window_bits = 4;
+        invalid.inflight = 3;
+        assert!(invalid.validate().is_err());
+        invalid.inflight = 1;
+        assert!(invalid.validate().is_ok());
+        assert_eq!(table_bytes(4), 64 * 16 * 64);
+        assert_eq!(table_bytes(8), 32 * 256 * 64);
+    }
+
     #[test]
     #[ignore = "requires actual Apple Silicon GPU access; absence is a failure"]
     fn metal_differential() -> Result<()> {
@@ -614,6 +942,7 @@ mod tests {
             .context("GPU required for hardware acceptance")?;
             let mut rng = ChaCha20Rng::from_seed([93; 32]);
             field_differential(&backend, &mut rng)?;
+            threadgroup_invert_differential(&backend)?;
             let mut keys = Vec::with_capacity(backend.capacity);
             let mut last = secp256k1::constants::CURVE_ORDER;
             last[31] -= 1;
@@ -625,6 +954,13 @@ mod tests {
             }
             while keys.len() < backend.capacity {
                 keys.push(crate::search::generate_secret_key(&mut rng));
+            }
+            {
+                let mut dual = MetalConfig::from_env()?;
+                dual.inflight = 2;
+                if let Some(mut dual) = MetalBackend::with_config(66, dual)? {
+                    inflight_overlap_differential(&mut dual, &keys[..66])?;
+                }
             }
             let counts: &[usize] =
                 if std::env::var("VANITY_DIFFERENTIAL_QUICK").as_deref() == Ok("1") {
@@ -654,8 +990,8 @@ mod tests {
                         "address case {index}, batch {count}"
                     );
                 }
-                let mut cleared = vec![1; backend.input.object.length()];
-                backend.input.read(0, &mut cleared);
+                let mut cleared = vec![1; backend.slots[0].input.object.length()];
+                backend.slots[0].input.read(0, &mut cleared);
                 assert!(
                     cleared.iter().all(|&byte| byte == 0),
                     "GPU secret buffer not cleared"
@@ -673,9 +1009,9 @@ mod tests {
             for bulk in [false, true] {
                 let failure: Result<()> = (|| {
                     let upload = if bulk {
-                        upload_keys_bulk(&mut backend.input, &keys[..33])
+                        upload_keys_bulk(&mut backend.slots[0].input, &keys[..33])
                     } else {
-                        upload_keys(&mut backend.input, &keys[..33])
+                        upload_keys(&mut backend.slots[0].input, &keys[..33])
                     };
                     let mut actual = Zeroizing::new(vec![0; 33 * 32]);
                     upload.0.read(0, &mut actual);
@@ -685,23 +1021,25 @@ mod tests {
                     anyhow::bail!("injected failure after upload");
                 })();
                 assert!(failure.is_err());
-                let mut cleared = vec![1; backend.input.object.length()];
-                backend.input.read(0, &mut cleared);
+                let mut cleared = vec![1; backend.slots[0].input.object.length()];
+                backend.slots[0].input.read(0, &mut cleared);
                 assert!(cleared.iter().all(|&byte| byte == 0));
             }
             let mut entered = false;
-            let too_large = backend.input.object.length() + 1;
+            let too_large = backend.slots[0].input.object.length() + 1;
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                backend.input.with_bytes_mut(too_large, |_| entered = true);
+                backend.slots[0]
+                    .input
+                    .with_bytes_mut(too_large, |_| entered = true);
             }));
             assert!(unwind.is_err() && !entered);
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _upload = upload_keys_bulk(&mut backend.input, &keys[..33]);
+                let _upload = upload_keys_bulk(&mut backend.slots[0].input, &keys[..33]);
                 panic!("injected upload unwind");
             }));
             assert!(unwind.is_err());
-            let mut cleared = vec![1; backend.input.object.length()];
-            backend.input.read(0, &mut cleared);
+            let mut cleared = vec![1; backend.slots[0].input.object.length()];
+            backend.slots[0].input.read(0, &mut cleared);
             assert!(cleared.iter().all(|&byte| byte == 0));
             Ok(())
         })

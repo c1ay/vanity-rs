@@ -8,6 +8,7 @@ use secp256k1::{All, Secp256k1, SecretKey};
 use serde::Serialize;
 use std::{
     cmp::Reverse,
+    collections::VecDeque,
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -206,6 +207,17 @@ fn run_with_rng_observed<B: AddressBackend, O: Observer>(
     )
 }
 
+fn clone_key_batch(keys: &[SecretKey]) -> Result<KeyBatch> {
+    let mut copied = Vec::with_capacity(keys.len());
+    for key in keys {
+        copied.push(
+            SecretKey::from_byte_array(key.secret_bytes())
+                .map_err(|_| anyhow::anyhow!("cannot copy search key"))?,
+        );
+    }
+    Ok(KeyBatch(copied))
+}
+
 fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
     backend: &mut B,
     batch_size: usize,
@@ -219,6 +231,9 @@ fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
         (1..=crate::backend::MAX_GPU_BATCH_SIZE as usize).contains(&batch_size),
         "invalid search batch size"
     );
+    if backend.inflight_capacity() > 1 {
+        return run_inflight_source(backend, batch_size, context, progress, source, observer);
+    }
     let mut addresses = vec![[0; 20]; batch_size];
     let mut counter = TryCounter {
         global: context.total,
@@ -309,6 +324,106 @@ fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
         source.recycle(context.stop)?;
     }
     Ok(None)
+}
+
+fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
+    backend: &mut B,
+    batch_size: usize,
+    context: WorkerContext<'_>,
+    mut progress: impl FnMut(Progress),
+    source: &mut S,
+    observer: &O,
+) -> Result<Option<HitRecord>> {
+    let cap = backend.inflight_capacity();
+    let mut addresses = vec![[0; 20]; batch_size];
+    let mut held = VecDeque::with_capacity(cap);
+    let mut counter = TryCounter {
+        global: context.total,
+        pending: 0,
+    };
+    let mut completed = 0u64;
+    let start = Instant::now();
+    let mut last_report = start;
+    let mut last_report_count = 0;
+    let mut hit = None;
+    while hit.is_none() {
+        while held.len() < cap && !context.stop.load(Ordering::Relaxed) {
+            let Some(keys) = source.next(context.stop)? else {
+                break;
+            };
+            backend.begin_batch(keys)?;
+            held.push_back(clone_key_batch(keys)?);
+            source.recycle(context.stop)?;
+        }
+        let Some(keys) = held.pop_front() else {
+            break;
+        };
+        backend.end_batch(&keys.0, &mut addresses)?;
+        let base = completed;
+        completed = completed
+            .checked_add(batch_size as u64)
+            .context("attempt counter overflow")?;
+        counter.pending += batch_size as u64;
+        if counter.pending >= GLOBAL_TRY_FLUSH {
+            counter.flush();
+        }
+        let matched = observer.start();
+        let (best, found) = evaluate_batch(&addresses, context.targets);
+        if let Some(index) = found
+            && B::VERIFY_CANDIDATES
+        {
+            cpu::verify_address(&keys.0[index], &addresses[index], context.verifier)?;
+        }
+        if let Some(candidate) = best {
+            let index = candidate.index;
+            let nibbles = address_nibbles(&addresses[index]);
+            let improved = context.best.consider_checked(
+                &nibbles,
+                &keys.0[index],
+                base + index as u64 + 1,
+                candidate.prefix,
+                candidate.suffix,
+                || {
+                    if B::VERIFY_CANDIDATES {
+                        cpu::verify_address(&keys.0[index], &addresses[index], context.verifier)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if improved {
+                let _ = context.updates.try_send(());
+            }
+        }
+        observer.finish(Stage::MatchVerify, matched);
+        if crossed_report_threshold(last_report_count, completed, context.report_every) {
+            let elapsed = last_report.elapsed().as_secs_f64();
+            progress(Progress {
+                completed,
+                total: counter.flush(),
+                rate: (completed - last_report_count) as f64 / elapsed.max(1e-6),
+                sample: addresses[batch_size - 1],
+            });
+            last_report = Instant::now();
+            last_report_count = completed;
+        }
+        if let Some(index) = found {
+            context.stop.store(true, Ordering::SeqCst);
+            hit = Some(HitRecord {
+                address: nibbles_to_hex(&address_nibbles(&addresses[index])),
+                private_key: sk_to_hex(&keys.0[index]),
+                tries: base + index as u64 + 1,
+                elapsed_sec: start.elapsed().as_secs_f64(),
+                worker_id: context.worker_id,
+                ts_utc: OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "NA".into()),
+            });
+        }
+    }
+    while let Some(keys) = held.pop_front() {
+        backend.end_batch(&keys.0, &mut addresses)?;
+    }
+    Ok(hit)
 }
 
 fn crossed_report_threshold(previous: u64, completed: u64, every: u64) -> bool {
@@ -828,6 +943,17 @@ mod tests {
             observer: O,
         }
         impl<O: Observer> AddressBackend for Observed<'_, O> {
+            fn inflight_capacity(&self) -> usize {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    self.backend.inflight_capacity()
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    1
+                }
+            }
+
             fn derive_batch(
                 &mut self,
                 keys: &[SecretKey],
@@ -842,6 +968,29 @@ mod tests {
                 {
                     let _ = &self.observer;
                     self.backend.derive_batch(keys, addresses)
+                }
+            }
+
+            fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    self.backend.begin_observed(keys, &self.observer)
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    let _ = keys;
+                    self.backend.begin_batch(keys)
+                }
+            }
+
+            fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    self.backend.end_observed(keys, addresses, &self.observer)
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    self.backend.end_batch(keys, addresses)
                 }
             }
         }

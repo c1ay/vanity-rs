@@ -20,6 +20,19 @@ pub(crate) trait AddressBackend {
     const VERIFY_CANDIDATES: bool = true;
 
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()>;
+
+    fn inflight_capacity(&self) -> usize {
+        1
+    }
+
+    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
+        let _ = keys;
+        bail!("begin_batch is Metal-only")
+    }
+
+    fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
+        self.derive_batch(keys, addresses)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

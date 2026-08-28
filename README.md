@@ -16,11 +16,11 @@ cargo run --release -- --backend cpu --workers 14 --suffix abc
 
 Metal is enabled on macOS ARM64 and has been measured on M4 Pro. Other platforms keep the CPU backend. MSL is embedded and compiled at startup; no offline `metal` compiler is required. First launch includes compile time, a fixed base-point table, and a known-vector self-test.
 
-`--workers` applies only to CPU; GPU mode warns and ignores it. `--gpu-batch-size` defaults to **262144** (range **1–262144**). On M4 Pro, sustained search at 262144 is about **3.72 million addresses/s**, ~19.8% faster than the same batch before the prep pipeline; 131072 is about 2.19% slower, so 262144 was chosen by a pre-set 2% rule. There is no startup auto-tune.
+`--workers` applies only to CPU; GPU mode warns and ignores it. `--gpu-batch-size` defaults to **262144** (range **1–262144**). On M4 Pro, sustained search at 262144 is about **6.01 million addresses/s** with 8-bit fixed-base windows and two in-flight GPU commands. There is no startup auto-tune.
 
-Batches of 65536 or more overlap the next random-key batch on one CPU thread with GPU compute. Smaller batches stay synchronous. There are two host key batches, one Metal in/out buffer pair, and at most one in-flight GPU batch. CPU and GPU address search are not mixed. Threadgroups stay at 128 on M4 Pro; dedicated square, fast modular add, and bulk-map experiments did not show a stable gain and are off.
+Batches of 65536 or more overlap the next random-key batch on one CPU thread with GPU compute. Smaller batches stay synchronous. There are two host key batches and two Metal in/out buffer pairs (at most two in-flight GPU commands). CPU and GPU address search are not mixed. Threadgroups stay at 128 on M4 Pro; dedicated square, fast modular add, bulk-map, and threadgroup Montgomery invert experiments did not show a stable gain and are off.
 
-For faster stop response, use `--gpu-batch-size 131072` (observed stop-tail median ~16 ms vs ~56 ms at 262144; observations, not worst-case bounds). Pairing results and rejected experiments: [M4 Pro report](docs/performance-m4-pro.md#分阶段优化2026-08-28第二轮实施).
+For faster stop response, use `--gpu-batch-size 65536` (observed stop-tail median ~19 ms vs ~50 ms at 262144 with two in-flight commands; observations, not worst-case bounds). Pairing results: [M4 Pro report](docs/performance-m4-pro.md#结构优化2026-08-28第三轮实施).
 
 Hits append to `found_wallet.jsonl` by default; the best candidate is `found_wallet-closest.json`. Use `--format txt` and `--append` for text files. Logs omit private keys unless you pass `--stdout`.
 
@@ -75,7 +75,7 @@ VANITY_BENCH_BACKEND=metal VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 ```
 
-Those variables are test-only. Bench files store counts and times, not keys. `VANITY_BENCH_PROFILE=1` enables diagnostic timing; `VANITY_BENCH_PIPELINE=0|1` compares sync vs pipeline. Other experiment switches (`VANITY_BENCH_BULK`, `VANITY_BENCH_ADD`, `VANITY_BENCH_SQUARE`, `VANITY_BENCH_GROUP`) are unused by the normal binary.
+Those variables are test-only. Bench files store counts and times, not keys. `VANITY_BENCH_PROFILE=1` enables diagnostic timing; `VANITY_BENCH_PIPELINE=0|1` compares sync vs pipeline. Other experiment switches (`VANITY_BENCH_BULK`, `VANITY_BENCH_ADD`, `VANITY_BENCH_SQUARE`, `VANITY_BENCH_GROUP`, `VANITY_BENCH_INVERT`, `VANITY_BENCH_WINDOW`, `VANITY_BENCH_INFLIGHT`) are unused by the normal binary.
 
 Implementation bounds: [GPU design notes](docs/gpu-optimization-design.md). Measurements: [M4 Pro report](docs/performance-m4-pro.md).
 
