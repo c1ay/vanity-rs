@@ -1,0 +1,7 @@
+/target
+found_wallet*
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

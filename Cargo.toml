@@ -1,0 +1,52 @@
+[package]
+name = "vanity-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "EVM vanity address generator with CPU parallelism and Apple Silicon Metal GPU support"
+license = "MIT"
+repository = "https://github.com/c1ay/vanity-rs"
+homepage = "https://github.com/c1ay/vanity-rs"
+readme = "README.md"
+authors = ["c1ay <liukaiash@gmail.com>"]
+keywords = ["ethereum", "vanity", "address", "gpu", "metal"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+# 高性能 secp256k1（C-accelerated）
+secp256k1 = { version = "0.31.1", features = ["rand"] }
+# Keccak-256
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# 随机数：每线程用 ChaCha20Rng，启动时用 OsRng 种子（兼顾速度与安全）
+rand = "0.8"
+rand_chacha = "0.3"
+
+# 并发与 CPU 数
+crossbeam = "0.8"
+num_cpus = "1.16"
+
+# 参数解析与序列化
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 精准时间
+time = { version = "0.3", features = ["formatting"] }
+
+# Logging & progress
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+anyhow = "1.0.100"
+console = "0.15"
+# 原子替换包含私钥的候选快照
+tempfile = "3.27"
+zeroize = "1.8"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+objc2 = "0.6.3"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+
+[dev-dependencies]
+num-bigint = "0.4"
