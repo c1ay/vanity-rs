@@ -181,7 +181,7 @@ static __device__ __forceinline__ Point point_select(Point a, Point b, uint32_t 
     return r;
 }
 
-static __device__ __forceinline__ Point add_window(Point a, Fe bx, Fe by, uint32_t digit) {
+static __device__ __forceinline__ Point add_mixed(Point a, Fe bx, Fe by) {
     Fe zz = fe_square(a.z);
     Fe u = fe_mul(bx, zz);
     Fe s = fe_mul(by, fe_mul(a.z, zz));
@@ -194,6 +194,11 @@ static __device__ __forceinline__ Point add_window(Point a, Fe bx, Fe by, uint32
     summed.x = fe_sub(fe_sub(fe_square(r), hhh), fe_add(v, v));
     summed.y = fe_sub(fe_mul(r, fe_sub(v, summed.x)), fe_mul(a.y, hhh));
     summed.z = fe_mul(a.z, h);
+    return summed;
+}
+
+static __device__ __forceinline__ Point add_window(Point a, Fe bx, Fe by, uint32_t digit) {
+    Point summed = add_mixed(a, bx, by);
     Point b;
     b.x = bx;
     b.y = by;
@@ -240,7 +245,7 @@ static __device__ __forceinline__ Point add_generator(Point p, const uint32_t *t
         gx.v[limb] = table[16u + limb];
         gy.v[limb] = table[24u + limb];
     }
-    return add_window(p, gx, gy, 1u);
+    return add_mixed(p, gx, gy);
 }
 
 static __device__ __forceinline__ uint32_t coordinate_byte(Fe a, uint32_t index) {

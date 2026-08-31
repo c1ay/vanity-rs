@@ -47,7 +47,7 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 ## 线程内分块 Montgomery 求逆
 
-`chunk_invert_affine_keccak` 让每个线程独立处理 `CHUNK_SIZE` 个连续点：正向累积前缀积（线程私有数组，无 barrier、无 threadgroup 内存），一次 `fe_inverse` 后反向展开，把每地址约 270 次域乘的求逆摊薄为 ~270/C + 3 次乘法。零 Z 沿用掩码防御（乘积中换 1，逆元清零）；尾部不足 C 项的线程按 `index < count` 跳过，填充项贡献 1、跳过 inv 更新是精确的。被否决的 threadgroup 版本（串行压在 lane 0）保留为 `VANITY_BENCH_INVERT`，与 chunk 互斥。默认 `CHUNK_SIZE=8`。
+`chunk_invert_affine_keccak` 让每个线程独立处理 `CHUNK_SIZE` 个连续点：正向累积前缀积（线程私有数组，无 barrier、无 threadgroup 内存），一次 `fe_inverse` 后反向展开，把每地址约 270 次域乘的求逆摊薄为 ~270/C + 3 次乘法。零 Z 沿用掩码防御（乘积中换 1，逆元清零）；尾部不足 C 项的线程按 `index < count` 跳过，填充项贡献 1、跳过 inv 更新是精确的。被否决的 threadgroup 版本（串行压在 lane 0）保留为 `VANITY_BENCH_INVERT`，与 chunk 互斥。默认 `CHUNK_SIZE=8`。在 stride=32 的增量路径上，chunk 16/32（整链一次求逆）15 秒初筛与 chunk 8 相差不到 0.3%，未达 3% 保留门槛，默认不改。
 
 ## 融合 Jacobian + 分块求逆
 
@@ -63,4 +63,4 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 ## 增量点加（默认 stride=32）
 
-融合 kernel 对每条链只做一次 `public_jacobian`，随后 `INCREMENT_STRIDE-1` 次 `P += G`（G 取自窗口 0 digit 1）。主机为每条链抽一个 CSPRNG 起点，再递增标量；链落在 `[2, n-1]`，避免 mixed-add 的倍点/无穷点例外。`VANITY_BENCH_STRIDE=1` 回到每地址一次标量乘。Dispatch 宽度为 `ceil(count / stride)`。CPU 后端仍逐钥 `from_secret_key`，不走增量。
+融合 kernel 对每条链只做一次 `public_jacobian`，随后 `INCREMENT_STRIDE-1` 次 `P += G`（G 取自窗口 0 digit 1，走不完整 `add_mixed`，不再做无穷点/零 digit 选择）。主机为每条链抽一个 CSPRNG 起点，再递增标量；链落在 `[2, n-1]`，避免 mixed-add 的倍点/无穷点例外。`VANITY_BENCH_STRIDE=1` 回到每地址一次标量乘。Dispatch 宽度为 `ceil(count / stride)`。CPU 后端仍逐钥 `from_secret_key`，不走增量。位交错 Keccak 在增量路径上重测仍约 ±1%，保持关闭。

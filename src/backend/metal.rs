@@ -68,8 +68,8 @@ impl MetalConfig {
             "VANITY_BENCH_INFLIGHT must be 1 or 2"
         );
         ensure!(
-            [0, 4, 8].contains(&self.chunk),
-            "VANITY_BENCH_CHUNK must be 0, 4 or 8"
+            [0, 4, 8, 16, 32].contains(&self.chunk),
+            "VANITY_BENCH_CHUNK must be 0, 4, 8, 16 or 32"
         );
         ensure!(
             self.chunk == 0 || !self.invert,
@@ -77,7 +77,7 @@ impl MetalConfig {
         );
         ensure!(
             !self.fuse || self.chunk > 0,
-            "VANITY_BENCH_FUSE requires VANITY_BENCH_CHUNK 4 or 8"
+            "VANITY_BENCH_FUSE requires chunked inversion"
         );
         ensure!(
             !self.fuse || !self.invert,
@@ -1006,6 +1006,13 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.chunk = 8;
         assert!(invalid.validate().is_ok());
+        invalid.chunk = 16;
+        assert!(invalid.validate().is_ok());
+        invalid.chunk = 32;
+        assert!(invalid.validate().is_ok());
+        invalid.chunk = 64;
+        assert!(invalid.validate().is_err());
+        invalid.chunk = 8;
         invalid.invert = true;
         assert!(invalid.validate().is_err());
         invalid.invert = false;
@@ -1111,10 +1118,9 @@ mod tests {
                 );
                 eprintln!("GPU differential batch {count}: passed");
             }
-            // Structural variants around the defaults (chunk 8, 16-bit
-            // windows): the unchunked single-kernel path, both chunk sizes,
-            // every window width, and interleaved Keccak. Chunk tails are
-            // covered by counts that are not multiples of 4 or 8.
+            // Structural variants around the defaults: unchunked path, chunk
+            // sizes 4/8/16/32, window widths, interleaved Keccak, and increment
+            // strides. Tails are covered by counts that are not multiples of 4/8.
             let candidates = [
                 MetalConfig {
                     chunk: 0,
@@ -1152,10 +1158,19 @@ mod tests {
                 },
                 MetalConfig {
                     stride: 8,
+                    chunk: 8,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
                     stride: 64,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 16,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 32,
                     ..MetalConfig::default()
                 },
             ];

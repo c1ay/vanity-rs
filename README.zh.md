@@ -89,7 +89,7 @@ VANITY_BENCH_BACKEND=vulkan VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 ```
 
-这些环境变量只供测试程序使用。基准文件仅记录计数和时间，不保留生成的私钥。诊断计时可用 `VANITY_BENCH_PROFILE=1`；`VANITY_BENCH_PIPELINE=0|1` 可做同步/流水线对照。其余实验开关为 `VANITY_BENCH_BULK=0|1`、`VANITY_BENCH_ADD=0|1`、`VANITY_BENCH_SQUARE=0|1`、`VANITY_BENCH_GROUP=auto|32|64|128|256`、`VANITY_BENCH_INVERT=0|1`、`VANITY_BENCH_WINDOW=4|8|16`、`VANITY_BENCH_INFLIGHT=1|2`、`VANITY_BENCH_CHUNK=0|4|8`、`VANITY_BENCH_KECCAK=0|1`、`VANITY_BENCH_FUSE=0|1` 和 `VANITY_BENCH_STRIDE=1|8|16|32|64`，普通程序不读取这些开关。正式吞吐比较应关闭诊断计时。
+这些环境变量只供测试程序使用。基准文件仅记录计数和时间，不保留生成的私钥。诊断计时可用 `VANITY_BENCH_PROFILE=1`；`VANITY_BENCH_PIPELINE=0|1` 可做同步/流水线对照。其余实验开关为 `VANITY_BENCH_BULK=0|1`、`VANITY_BENCH_ADD=0|1`、`VANITY_BENCH_SQUARE=0|1`、`VANITY_BENCH_GROUP=auto|32|64|128|256`、`VANITY_BENCH_INVERT=0|1`、`VANITY_BENCH_WINDOW=4|8|16`、`VANITY_BENCH_INFLIGHT=1|2`、`VANITY_BENCH_CHUNK=0|4|8|16|32`、`VANITY_BENCH_KECCAK=0|1`、`VANITY_BENCH_FUSE=0|1` 和 `VANITY_BENCH_STRIDE=1|8|16|32|64`，普通程序不读取这些开关。正式吞吐比较应关闭诊断计时。
 
 所有实验的冻结源码、二进制、配置、哈希、日志和原始数据保存在独立的 `target/gpu-optimization/20260828-m4-stages/`，没有覆盖旧实验。设计和整数上界证明见 [实现说明](docs/gpu-optimization-design.md)。
 

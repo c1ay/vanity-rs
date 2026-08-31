@@ -215,7 +215,7 @@ inline Point point_select(Point a, Point b, uint mask) {
     Point r = {fe_select(a.x, b.x, mask), fe_select(a.y, b.y, mask), fe_select(a.z, b.z, mask)};
     return r;
 }
-inline Point add_window(Point a, Fe bx, Fe by, uint digit) {
+inline Point add_mixed(Point a, Fe bx, Fe by) {
     Fe zz = fe_square(a.z);
     Fe u = fe_mul(bx, zz);
     Fe s = fe_mul(by, fe_mul(a.z, zz));
@@ -228,6 +228,10 @@ inline Point add_window(Point a, Fe bx, Fe by, uint digit) {
     out.x = fe_sub(fe_sub(fe_square(r), hhh), fe_add(v, v));
     out.y = fe_sub(fe_mul(r, fe_sub(v, out.x)), fe_mul(a.y, hhh));
     out.z = fe_mul(a.z, h);
+    return out;
+}
+inline Point add_window(Point a, Fe bx, Fe by, uint digit) {
+    Point out = add_mixed(a, bx, by);
     Point b = {bx, by, fe_one()};
     out = point_select(out, b, fe_zero_mask(a.z));
     return point_select(out, a, mask_if(digit == 0));
@@ -308,7 +312,7 @@ inline Point add_generator(Point p, device const uint *table) {
         gx.v[limb] = table[16 + limb];
         gy.v[limb] = table[24 + limb];
     }
-    return add_window(p, gx, gy, 1u);
+    return add_mixed(p, gx, gy);
 }
 
 inline Point to_affine(Point sum) {
@@ -621,6 +625,8 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
     if (base >= count) return;
     uint chain = min(uint(INCREMENT_STRIDE), count - base);
     Point p = public_jacobian(keys + base * 32, table);
+    // CHUNK_SIZE == INCREMENT_STRIDE inverts the whole chain once; smaller
+    // chunks repeat invert to cut thread-private Point arrays.
     for (uint offset = 0; offset < chain; offset += CHUNK_SIZE) {
         uint n = min(uint(CHUNK_SIZE), chain - offset);
         Point pts[CHUNK_SIZE];
