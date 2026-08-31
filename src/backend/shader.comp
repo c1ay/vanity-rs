@@ -7,6 +7,9 @@
 
 #define WINDOW_BITS 16
 #define CHUNK_SIZE 8
+#ifndef INCREMENT_STRIDE
+#define INCREMENT_STRIDE 32
+#endif
 
 layout(local_size_x = 64) in;
 
@@ -235,6 +238,15 @@ Point public_jacobian(uint key_index) {
     return sum;
 }
 
+Point add_generator(Point p) {
+    Fe gx, gy;
+    for (uint limb = 0; limb < 8u; ++limb) {
+        gx.v[limb] = table.words[16u + limb];
+        gy.v[limb] = table.words[24u + limb];
+    }
+    return add_window(p, gx, gy, 1u);
+}
+
 uint coordinate_byte(Fe a, uint index) {
     return (a.v[7u - index / 4u] >> ((3u - index % 4u) * 8u)) & 0xffu;
 }
@@ -324,6 +336,23 @@ void montgomery_chunk_affine_keccak(Point pts[CHUNK_SIZE], uint base, uint count
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
+#if INCREMENT_STRIDE > 1
+    uint base = gid * INCREMENT_STRIDE;
+    if (base >= push.count) return;
+    uint chain = min(INCREMENT_STRIDE, push.count - base);
+    Point p = public_jacobian(base);
+    for (uint offset = 0; offset < chain; offset += CHUNK_SIZE) {
+        uint n = min(CHUNK_SIZE, chain - offset);
+        Point pts[CHUNK_SIZE];
+        for (uint i = 0; i < CHUNK_SIZE; ++i) {
+            if (i < n) {
+                pts[i] = p;
+                if (offset + i + 1u < chain) p = add_generator(p);
+            }
+        }
+        montgomery_chunk_affine_keccak(pts, base + offset, push.count);
+    }
+#else
     uint base = gid * CHUNK_SIZE;
     if (base >= push.count) return;
     Point pts[CHUNK_SIZE];
@@ -332,4 +361,5 @@ void main() {
         if (index < push.count) pts[i] = public_jacobian(index);
     }
     montgomery_chunk_affine_keccak(pts, base, push.count);
+#endif
 }

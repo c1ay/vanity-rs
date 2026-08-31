@@ -36,6 +36,7 @@ pub(crate) struct MetalConfig {
     pub(crate) chunk: u8,
     pub(crate) keccak: bool,
     pub(crate) fuse: bool,
+    pub(crate) stride: u8,
 }
 
 impl Default for MetalConfig {
@@ -51,6 +52,7 @@ impl Default for MetalConfig {
             chunk: 8,
             keccak: false,
             fuse: true,
+            stride: super::DEFAULT_INCREMENT_STRIDE as u8,
         }
     }
 }
@@ -80,6 +82,14 @@ impl MetalConfig {
         ensure!(
             !self.fuse || !self.invert,
             "fused and threadgroup inversion are mutually exclusive"
+        );
+        ensure!(
+            self.stride == 1
+                || ([8, 16, 32, 64].contains(&self.stride)
+                    && self.fuse
+                    && self.chunk > 0
+                    && self.stride % self.chunk == 0),
+            "VANITY_BENCH_STRIDE must be 1, or 8/16/32/64 with fused chunk inversion"
         );
         Ok(())
     }
@@ -126,6 +136,11 @@ impl MetalConfig {
         }
         if config.invert && std::env::var("VANITY_BENCH_FUSE").is_err() {
             config.fuse = false;
+        }
+        if let Ok(value) = std::env::var("VANITY_BENCH_STRIDE") {
+            config.stride = value.parse().context("invalid benchmark stride")?;
+        } else if !config.fuse || config.chunk == 0 {
+            config.stride = 1;
         }
         config.validate()?;
         Ok(config)
@@ -313,13 +328,14 @@ impl MetalBackend {
                 return Ok(None);
             };
             let mut source = format!(
-                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n{}",
+                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n#define INCREMENT_STRIDE {}\n{}",
                 u8::from(config.square),
                 u8::from(config.fast_add),
                 u8::from(config.invert),
                 config.window_bits,
                 config.chunk,
                 u8::from(config.keccak),
+                config.stride,
                 include_str!("shader.metal")
             );
             // Diagnostic entry points are not included in production binaries.
@@ -403,20 +419,10 @@ impl MetalBackend {
     }
 
     fn self_test(&mut self) -> Result<()> {
-        let mut one = [0; 32];
-        one[31] = 1;
-        let mut two = one;
-        two[31] = 2;
-        let mut last = secp256k1::constants::CURVE_ORDER;
-        last[31] -= 1;
-        let keys: Vec<_> = [one, two, last]
-            .into_iter()
-            .map(SecretKey::from_byte_array)
-            .collect::<std::result::Result<_, _>>()?;
-        for chunk in keys.chunks(self.capacity) {
-            let mut addresses = vec![[0; 20]; chunk.len()];
-            self.derive_batch(chunk, &mut addresses)?;
-            for (key, address) in chunk.iter().zip(&addresses) {
+        for keys in super::gpu_self_test_batches(self.config.stride as usize, self.capacity)? {
+            let mut addresses = vec![[0; 20]; keys.len()];
+            self.derive_batch(&keys, &mut addresses)?;
+            for (key, address) in keys.iter().zip(&addresses) {
                 cpu::verify_address(key, address, &self.verifier)?;
             }
         }
@@ -621,6 +627,14 @@ impl AddressBackend for MetalBackend {
         self.slots.len()
     }
 
+    fn increment_stride(&self) -> usize {
+        if self.config.fuse && self.config.stride > 1 {
+            self.config.stride as usize
+        } else {
+            1
+        }
+    }
+
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
         self.derive_observed(keys, addresses, &Noop)
     }
@@ -686,12 +700,17 @@ impl MetalBackend {
                     .chunk_pipeline
                     .as_ref()
                     .context("fused path missing chunk pipeline")?;
+                let step = if self.config.stride > 1 {
+                    self.config.stride as usize
+                } else {
+                    chunk
+                };
                 encode_compute(
                     &completion.command,
                     pipeline,
                     (&slot.input, &self.table, &slot.output),
                     keys.len(),
-                    keys.len().div_ceil(chunk),
+                    keys.len().div_ceil(step.max(1)),
                     group,
                 )?;
             } else if invert || chunk > 0 {
@@ -991,6 +1010,14 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.invert = false;
         assert!(invalid.validate().is_ok());
+        invalid.stride = 3;
+        assert!(invalid.validate().is_err());
+        invalid.stride = 32;
+        invalid.fuse = false;
+        assert!(invalid.validate().is_err());
+        invalid.fuse = true;
+        invalid.stride = 1;
+        assert!(invalid.validate().is_ok());
     }
 
     #[test]
@@ -1017,11 +1044,35 @@ mod tests {
             while keys.len() < backend.capacity {
                 keys.push(crate::search::generate_secret_key(&mut rng));
             }
+            let seq_keys = {
+                let mut bytes = [0; 32];
+                bytes[31] = 2;
+                let mut key = SecretKey::from_byte_array(bytes)?;
+                let mut chain = Vec::with_capacity(backend.capacity);
+                for index in 0..backend.capacity {
+                    if index > 0 {
+                        key = super::super::increment_secret_key(&key)
+                            .context("sequential test key overflow")?;
+                    }
+                    chain.push(key);
+                }
+                chain
+            };
+            let address_keys = if backend.increment_stride() > 1 {
+                &seq_keys
+            } else {
+                &keys
+            };
             {
                 let mut dual = MetalConfig::from_env()?;
                 dual.inflight = 2;
                 if let Some(mut dual) = MetalBackend::with_config(66, dual)? {
-                    inflight_overlap_differential(&mut dual, &keys[..66])?;
+                    let overlap = if dual.increment_stride() > 1 {
+                        &seq_keys[..66]
+                    } else {
+                        &keys[..66]
+                    };
+                    inflight_overlap_differential(&mut dual, overlap)?;
                 }
             }
             let counts: &[usize] =
@@ -1035,11 +1086,11 @@ mod tests {
                 };
             for &count in counts {
                 let mut addresses = vec![[0; 20]; count];
-                backend.derive_batch(&keys[..count], &mut addresses)?;
-                let public = diagnostic_public_keys(&mut backend, &keys[..count])?;
+                backend.derive_batch(&address_keys[..count], &mut addresses)?;
+                let public = diagnostic_public_keys(&mut backend, &address_keys[..count])?;
                 for index in 0..count {
                     let expected_public =
-                        PublicKey::from_secret_key(&backend.verifier, &keys[index])
+                        PublicKey::from_secret_key(&backend.verifier, &address_keys[index])
                             .serialize_uncompressed();
                     assert_eq!(
                         public[index],
@@ -1048,7 +1099,7 @@ mod tests {
                     );
                     assert_eq!(
                         addresses[index],
-                        cpu::derive_address(&keys[index], &backend.verifier),
+                        cpu::derive_address(&address_keys[index], &backend.verifier),
                         "address case {index}, batch {count}"
                     );
                 }
@@ -1069,6 +1120,7 @@ mod tests {
                     chunk: 0,
                     window_bits: 8,
                     fuse: false,
+                    stride: 1,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
@@ -1091,19 +1143,33 @@ mod tests {
                 },
                 MetalConfig {
                     fuse: false,
+                    stride: 1,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    stride: 1,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    stride: 8,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    stride: 64,
                     ..MetalConfig::default()
                 },
             ];
             for (which, config) in candidates.into_iter().enumerate() {
+                let batch_keys = if config.stride > 1 { &seq_keys } else { &keys };
                 let mut candidate = MetalBackend::with_config(4099, config)?
                     .context("GPU required for hardware acceptance")?;
                 for &count in &[1usize, 33, 129, 4095, 4099] {
                     let mut addresses = vec![[0; 20]; count];
-                    candidate.derive_batch(&keys[..count], &mut addresses)?;
+                    candidate.derive_batch(&batch_keys[..count], &mut addresses)?;
                     for index in 0..count {
                         assert_eq!(
                             addresses[index],
-                            cpu::derive_address(&keys[index], &candidate.verifier),
+                            cpu::derive_address(&batch_keys[index], &candidate.verifier),
                             "candidate {which} address case {index}, batch {count}"
                         );
                     }

@@ -18,7 +18,7 @@ cargo run --release -- --backend cpu --workers 14 --suffix abc
 
 Metal is enabled on macOS ARM64 and has been measured on M4 Pro. CUDA loads the NVIDIA driver at runtime (`libcuda.so.1` / `nvcuda.dll`); it is skipped on macOS so it never competes with Metal, and it does not require the CUDA Toolkit or `nvcc` to build or run. Vulkan is compiled in on all platforms, loads the system Vulkan loader at runtime (`libvulkan.so.1` / `vulkan-1.dll`), and is skipped on macOS so it never competes with Metal. Other platforms without a usable GPU keep the CPU backend. MSL is embedded and compiled at startup; CUDA ships precompiled PTX (`src/backend/shader.ptx`, rebuilt with `nvcc -ptx -arch=compute_60 -o src/backend/shader.ptx src/backend/shader.cu`); Vulkan ships a precompiled SPIR-V module (`src/backend/shader.spv`, rebuilt with `glslangValidator -V --target-env vulkan1.1 -o src/backend/shader.spv src/backend/shader.comp`). First launch includes table setup and a known-vector self-test.
 
-`--workers` applies only to CPU; GPU mode warns and ignores it. `--gpu-batch-size` defaults to **262144** (range **1–262144**). On M4 Pro, sustained search at 262144 is about **14.0 million addresses/s** with 16-bit fixed-base windows, fused per-thread chunked inversion, and two in-flight GPU commands. There is no startup auto-tune.
+`--workers` applies only to CPU; GPU mode warns and ignores it. `--gpu-batch-size` defaults to **262144** (range **1–262144**). On M4 Pro, sustained search at 262144 is about **29 million addresses/s** with 16-bit fixed-base windows, fused per-thread chunked inversion, two in-flight GPU commands, and increment chains of 32 (`k·G` once, then `P += G`). There is no startup auto-tune.
 
 Batches of 65536 or more overlap the next random-key batch on one CPU thread with GPU compute. Smaller batches stay synchronous. There are two host key batches and two Metal in/out buffer pairs (at most two in-flight GPU commands). CPU and GPU address search are not mixed. Threadgroups stay at 128 on M4 Pro; dedicated square, fast modular add, bulk-map, and threadgroup Montgomery invert experiments did not show a stable gain and are off.
 
@@ -43,7 +43,7 @@ Requires Rust 1.85+ (`edition = "2024"`).
 
 ## Keys and correctness
 
-Each worker seeds ChaCha20 from OsRng and rejection-samples valid scalars. There is no sequential private-key scan and no production fixed-seed switch.
+Each worker seeds ChaCha20 from OsRng and rejection-samples valid scalars. GPU batches then walk a short increment chain from each CSPRNG start (`k, k+1, …, k+31` by default) so the kernel can add `G` instead of repeating a full scalar multiplication. There is no scan from a low-entropy origin and no production fixed-seed switch.
 
 GPU startup runs a known-vector self-test. Each batch spot-checks one item on CPU. Every hit or published best candidate is recomputed independently. Matching always uses the same Rust logic. A verification failure stops the search and does not publish that batch.
 
@@ -87,7 +87,7 @@ VANITY_BENCH_BACKEND=vulkan VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 ```
 
-Those variables are test-only. Bench files store counts and times, not keys. `VANITY_BENCH_PROFILE=1` enables diagnostic timing; `VANITY_BENCH_PIPELINE=0|1` compares sync vs pipeline. Other experiment switches (`VANITY_BENCH_BULK`, `VANITY_BENCH_ADD`, `VANITY_BENCH_SQUARE`, `VANITY_BENCH_GROUP`, `VANITY_BENCH_INVERT`, `VANITY_BENCH_WINDOW`, `VANITY_BENCH_INFLIGHT`, `VANITY_BENCH_CHUNK`, `VANITY_BENCH_KECCAK`, `VANITY_BENCH_FUSE`) are unused by the normal binary.
+Those variables are test-only. Bench files store counts and times, not keys. `VANITY_BENCH_PROFILE=1` enables diagnostic timing; `VANITY_BENCH_PIPELINE=0|1` compares sync vs pipeline. Other experiment switches (`VANITY_BENCH_BULK`, `VANITY_BENCH_ADD`, `VANITY_BENCH_SQUARE`, `VANITY_BENCH_GROUP`, `VANITY_BENCH_INVERT`, `VANITY_BENCH_WINDOW`, `VANITY_BENCH_INFLIGHT`, `VANITY_BENCH_CHUNK`, `VANITY_BENCH_KECCAK`, `VANITY_BENCH_FUSE`, `VANITY_BENCH_STRIDE`) are unused by the normal binary.
 
 Implementation bounds: [GPU design notes](docs/gpu-optimization-design.md). Measurements: [M4 Pro report](docs/performance-m4-pro.md).
 

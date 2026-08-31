@@ -156,6 +156,7 @@ struct SequentialSource<'a, R, O> {
     rng: &'a mut R,
     keys: KeyBatch,
     size: usize,
+    stride: usize,
     observer: O,
 }
 
@@ -163,13 +164,13 @@ impl<R: RngCore + CryptoRng, O: Observer> KeySource for SequentialSource<'_, R, 
     #[inline]
     fn next(&mut self, stop: &AtomicBool) -> Result<Option<&[SecretKey]>> {
         let started = self.observer.start();
-        for key in &mut self.keys.0 {
-            key.non_secure_erase();
-            *key = generate_secret_key(self.rng);
-        }
-        while self.keys.0.len() < self.size {
-            self.keys.0.push(generate_secret_key(self.rng));
-        }
+        fill_secret_keys(
+            self.rng,
+            &mut self.keys.0,
+            self.size,
+            self.stride,
+            Some(stop),
+        );
         self.observer.finish(Stage::Prepare, started);
         Ok((!stop.load(Ordering::Relaxed)).then_some(&self.keys.0))
     }
@@ -195,6 +196,7 @@ fn run_with_rng_observed<B: AddressBackend, O: Observer>(
         rng,
         keys: KeyBatch(Vec::with_capacity(batch_size)),
         size: batch_size,
+        stride: backend.increment_stride().max(1),
         observer: observer.clone(),
     };
     run_with_source(
@@ -600,6 +602,84 @@ pub(crate) fn generate_secret_key(rng: &mut (impl RngCore + CryptoRng)) -> Secre
     }
 }
 
+/// Fill `size` keys. `stride > 1` emits CSPRNG chain starts, then k+1..k+stride-1.
+/// Each chain still has 256-bit starting entropy; offsets are not independent draws.
+/// Returns false if `stop` is set mid-batch; already-written keys stay in `keys`.
+pub(crate) fn fill_secret_keys(
+    rng: &mut (impl RngCore + CryptoRng),
+    keys: &mut Vec<SecretKey>,
+    size: usize,
+    stride: usize,
+    stop: Option<&AtomicBool>,
+) -> bool {
+    keys.truncate(size);
+    if stride <= 1 {
+        for (index, key) in keys.iter_mut().enumerate() {
+            if index > 0
+                && index % 1024 == 0
+                && stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return false;
+            }
+            key.non_secure_erase();
+            *key = generate_secret_key(rng);
+        }
+        while keys.len() < size {
+            if keys.len() % 1024 == 0
+                && !keys.is_empty()
+                && stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return false;
+            }
+            keys.push(generate_secret_key(rng));
+        }
+        return true;
+    }
+    let mut index = 0;
+    while index < size {
+        if index > 0 && index % 1024 == 0 && stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return false;
+        }
+        let chain = (size - index).min(stride);
+        loop {
+            let mut current = generate_secret_key(rng);
+            if chain > 1 && crate::backend::is_generator_scalar(&current) {
+                continue;
+            }
+            let mut next_index = index;
+            let mut ok = true;
+            for step in 0..chain {
+                if step > 0 {
+                    match crate::backend::increment_secret_key(&current) {
+                        Some(next) => current = next,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if next_index < keys.len() {
+                    keys[next_index].non_secure_erase();
+                    keys[next_index] = current;
+                } else {
+                    keys.push(current);
+                }
+                next_index += 1;
+            }
+            if ok {
+                index = next_index;
+                break;
+            }
+            while keys.len() > index {
+                if let Some(mut key) = keys.pop() {
+                    key.non_secure_erase();
+                }
+            }
+        }
+    }
+    true
+}
+
 /// 将 40 个 nibbles（0..15）转为小写十六进制字符串（仅在写文件/打印时使用）
 pub(crate) fn nibbles_to_hex(nibs: &[u8; 40]) -> String {
     // 比 string::from_utf8(hex::encode(...)) 少一步拷贝；这里手工映射更快
@@ -802,6 +882,37 @@ mod tests {
             assert!(best.snapshot().is_none());
             assert!(receiver.try_recv().is_err());
         }
+    }
+
+    #[test]
+    fn fill_secret_keys_emits_increment_chains() {
+        let mut rng = ChaCha20Rng::from_seed([23; 32]);
+        let mut keys = Vec::new();
+        assert!(fill_secret_keys(&mut rng, &mut keys, 40, 32, None));
+        assert_eq!(keys.len(), 40);
+        for start in (0..32).step_by(32) {
+            let mut current = keys[start];
+            for key in &keys[start + 1..32] {
+                current = crate::backend::increment_secret_key(&current).unwrap();
+                assert_eq!(*key, current);
+            }
+        }
+        assert_eq!(
+            keys[33],
+            crate::backend::increment_secret_key(&keys[32]).unwrap()
+        );
+        assert!(!crate::backend::is_generator_scalar(&keys[0]));
+        let mut independent = Vec::new();
+        let mut expected = ChaCha20Rng::from_seed([23; 32]);
+        assert!(fill_secret_keys(
+            &mut ChaCha20Rng::from_seed([23; 32]),
+            &mut independent,
+            3,
+            1,
+            None
+        ));
+        assert_eq!(independent[0], generate_secret_key(&mut expected));
+        assert_eq!(independent[1], generate_secret_key(&mut expected));
     }
 
     #[test]

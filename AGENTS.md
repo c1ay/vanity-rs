@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - `src/main.rs` — CLI, progress UI, and file output.
 - `src/backend/` — address derivation: CPU (`cpu.rs`), Apple Silicon Metal (`metal.rs`, `shader.metal`), CUDA (`cuda.rs`, `shader.cu`, `shader.ptx`), and Vulkan (`vulkan.rs`, `shader.comp`, `shader.spv`). Shared fixed-base table construction lives in `table.rs`. Backends fill address slices from valid `SecretKey` batches; they do not match, rank, or write files.
-- `src/search.rs` and `src/search/pipeline.rs` — CSPRNG, matching, ranking, cancellation, and optional GPU key-prep overlap.
+- `src/search.rs` and `src/search/pipeline.rs` — CSPRNG, increment chains, matching, ranking, cancellation, and optional GPU key-prep overlap.
 - `src/timing.rs` — optional stage timing for benchmarks.
 - `tests/cli.rs` — binary-level output, permissions, and persistence checks.
 - `docs/` — performance notes and GPU implementation bounds. Benchmark artifacts belong in `target/` or other gitignored scratch space, never in `src/`.

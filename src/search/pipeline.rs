@@ -91,6 +91,7 @@ fn produce<R: RngCore + CryptoRng, O: Observer>(
     ready: channel::Sender<PreparedBatch>,
     stop: &AtomicBool,
     batch_size: usize,
+    stride: usize,
     observer: O,
     seed: impl FnOnce() -> Result<R>,
 ) -> Result<()> {
@@ -105,18 +106,9 @@ fn produce<R: RngCore + CryptoRng, O: Observer>(
             break;
         };
         let preparing = observer.start();
-        for first in (0..batch_size).step_by(1024) {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            for index in first..(first + 1024).min(batch_size) {
-                if let Some(key) = batch.keys.0.get_mut(index) {
-                    key.non_secure_erase();
-                    *key = generate_secret_key(&mut rng);
-                } else {
-                    batch.keys.0.push(generate_secret_key(&mut rng));
-                }
-            }
+        if !fill_secret_keys(&mut rng, &mut batch.keys.0, batch_size, stride, Some(stop)) {
+            observer.finish(Stage::Prepare, preparing);
+            return Ok(());
         }
         observer.finish(Stage::Prepare, preparing);
         batch.sequence = sequence;
@@ -163,12 +155,14 @@ where
         // On consumer unwind this guard cancels before scope's implicit join.
         let _scope_stop = StopOnExit(stop);
         let producer_observer = observer.clone();
+        let stride = backend.increment_stride().max(1);
         let producer = scope.spawn(move || {
             produce(
                 recycle_rx,
                 ready_tx,
                 stop,
                 batch_size,
+                stride,
                 producer_observer,
                 seed,
             )
@@ -249,7 +243,7 @@ mod tests {
         std::thread::scope(|scope| -> Result<()> {
             let guard = StopOnExit(&stop);
             let producer = scope.spawn(|| {
-                produce(recycle_rx, ready_tx, &stop, 33, Noop, || {
+                produce(recycle_rx, ready_tx, &stop, 33, 1, Noop, || {
                     Ok(ChaCha20Rng::from_seed([19; 32]))
                 })
             });
@@ -507,7 +501,7 @@ mod tests {
                 keys: KeyBatch(Vec::with_capacity(2048)),
             })
             .unwrap();
-        produce(recycle_rx, ready_tx, &stop, 2048, Noop, || {
+        produce(recycle_rx, ready_tx, &stop, 2048, 1, Noop, || {
             Ok(CancellingRng {
                 generated: &generated,
                 stop: &stop,

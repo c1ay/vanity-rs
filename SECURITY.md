@@ -4,7 +4,7 @@
 
 ## What this tool does and does not do
 
-- Keys are produced with `OsRng` → ChaCha20 and rejection sampling of valid secp256k1 scalars. There is no sequential key scan and no production fixed-seed switch.
+- Keys are produced with `OsRng` → ChaCha20 and rejection sampling of valid secp256k1 scalars. GPU search then uses short increment chains (`k, k+1, …`) from those CSPRNG starts so the kernel can add `G` instead of repeating a full scalar multiplication. There is no scan from a low-entropy origin and no production fixed-seed switch.
 - Hits are written to disk with Unix mode `0600`. Default logs omit private keys; `--stdout` prints them.
 - The Metal, CUDA, and Vulkan backends are custom finite-field / secp256k1 / Keccak implementations. Start-up self-tests and per-batch CPU checks compare GPU results to libsecp256k1 and tiny-keccak. **Those checks are not a substitute for an independent cryptographic or side-channel audit.**
 

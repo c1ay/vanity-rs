@@ -13,6 +13,9 @@
 
 #define WINDOW_BITS 16
 #define CHUNK_SIZE 8
+#ifndef INCREMENT_STRIDE
+#define INCREMENT_STRIDE 32
+#endif
 
 struct Fe {
     uint32_t v[8];
@@ -231,6 +234,15 @@ static __device__ __forceinline__ Point public_jacobian(const uint32_t *keys, co
     return sum;
 }
 
+static __device__ __forceinline__ Point add_generator(Point p, const uint32_t *table) {
+    Fe gx, gy;
+    for (uint32_t limb = 0; limb < 8u; ++limb) {
+        gx.v[limb] = table[16u + limb];
+        gy.v[limb] = table[24u + limb];
+    }
+    return add_window(p, gx, gy, 1u);
+}
+
 static __device__ __forceinline__ uint32_t coordinate_byte(Fe a, uint32_t index) {
     return (a.v[7u - index / 4u] >> ((3u - index % 4u) * 8u)) & 0xffu;
 }
@@ -321,6 +333,23 @@ static __device__ __forceinline__ void montgomery_chunk_affine_keccak(Point pts[
 extern "C" __global__ void chunk_derive_addresses(const uint32_t *keys, const uint32_t *table,
                                                   uint32_t *addresses, uint32_t count) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+#if INCREMENT_STRIDE > 1
+    uint32_t base = gid * INCREMENT_STRIDE;
+    if (base >= count) return;
+    uint32_t chain = INCREMENT_STRIDE < count - base ? INCREMENT_STRIDE : count - base;
+    Point p = public_jacobian(keys, table, base);
+    for (uint32_t offset = 0; offset < chain; offset += CHUNK_SIZE) {
+        uint32_t n = CHUNK_SIZE < chain - offset ? CHUNK_SIZE : chain - offset;
+        Point pts[CHUNK_SIZE];
+        for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
+            if (i < n) {
+                pts[i] = p;
+                if (offset + i + 1u < chain) p = add_generator(p, table);
+            }
+        }
+        montgomery_chunk_affine_keccak(pts, addresses, base + offset, count);
+    }
+#else
     uint32_t base = gid * CHUNK_SIZE;
     if (base >= count) return;
     Point pts[CHUNK_SIZE];
@@ -329,4 +358,5 @@ extern "C" __global__ void chunk_derive_addresses(const uint32_t *keys, const ui
         if (index < count) pts[i] = public_jacobian(keys, table, index);
     }
     montgomery_chunk_affine_keccak(pts, addresses, base, count);
+#endif
 }

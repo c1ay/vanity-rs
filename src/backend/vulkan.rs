@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{Address, AddressBackend, cpu, table};
 
 const WINDOW_BITS: u8 = 16;
-const CHUNK_SIZE: u32 = 8;
+const INCREMENT_STRIDE: u32 = super::DEFAULT_INCREMENT_STRIDE;
 const WORKGROUP_SIZE: u32 = 64;
 const INFLIGHT: usize = 2;
 const AMD_VENDOR_ID: u32 = 0x1002;
@@ -149,20 +149,10 @@ impl VulkanBackend {
     }
 
     fn self_test(&mut self) -> Result<()> {
-        let mut one = [0; 32];
-        one[31] = 1;
-        let mut two = one;
-        two[31] = 2;
-        let mut last = secp256k1::constants::CURVE_ORDER;
-        last[31] -= 1;
-        let keys: Vec<_> = [one, two, last]
-            .into_iter()
-            .map(SecretKey::from_byte_array)
-            .collect::<std::result::Result<_, _>>()?;
-        for chunk in keys.chunks(self.capacity) {
-            let mut addresses = vec![[0; 20]; chunk.len()];
-            self.derive_batch(chunk, &mut addresses)?;
-            for (key, address) in chunk.iter().zip(&addresses) {
+        for keys in super::gpu_self_test_batches(INCREMENT_STRIDE as usize, self.capacity)? {
+            let mut addresses = vec![[0; 20]; keys.len()];
+            self.derive_batch(&keys, &mut addresses)?;
+            for (key, address) in keys.iter().zip(&addresses) {
                 cpu::verify_address(key, address, &self.verifier)?;
             }
         }
@@ -199,6 +189,10 @@ impl AddressBackend for VulkanBackend {
         self.slots.len()
     }
 
+    fn increment_stride(&self) -> usize {
+        INCREMENT_STRIDE as usize
+    }
+
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
         self.begin_batch(keys)?;
         self.end_batch(keys, addresses)
@@ -219,7 +213,7 @@ impl AddressBackend for VulkanBackend {
             "Vulkan slot still holds an in-flight command"
         );
         Self::write_keys(&mut self.slots[submit_at].keys, keys);
-        let threads = (keys.len() as u32).div_ceil(CHUNK_SIZE);
+        let threads = (keys.len() as u32).div_ceil(INCREMENT_STRIDE);
         let groups = threads.div_ceil(WORKGROUP_SIZE);
         let count = keys.len() as u32;
         let slot = &self.slots[submit_at];
@@ -849,8 +843,6 @@ fn destroy_buffer(device: &Device, buffer: &mut GpuBuffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{RngCore, SeedableRng};
-    use rand_chacha::ChaCha20Rng;
 
     #[test]
     fn vulkan_is_unavailable_on_macos() {
@@ -865,25 +857,7 @@ mod tests {
     fn vulkan_differential() -> Result<()> {
         let mut backend = VulkanBackend::new(super::super::MAX_GPU_BATCH_SIZE as usize)?
             .context("GPU required for hardware acceptance")?;
-        let mut rng = ChaCha20Rng::from_seed([93; 32]);
-        let mut keys = Vec::with_capacity(backend.capacity);
-        let mut last = secp256k1::constants::CURVE_ORDER;
-        last[31] -= 1;
-        keys.push(SecretKey::from_byte_array(last)?);
-        for bit in 0..256 {
-            let mut scalar = [0; 32];
-            scalar[31 - bit / 8] |= 1 << (bit % 8);
-            if let Ok(key) = SecretKey::from_byte_array(scalar) {
-                keys.push(key);
-            }
-        }
-        for _ in 0..64 {
-            let mut scalar = [0; 32];
-            rng.fill_bytes(&mut scalar);
-            if let Ok(key) = SecretKey::from_byte_array(scalar) {
-                keys.push(key);
-            }
-        }
+        let keys = super::super::sequential_test_keys(backend.capacity)?;
         for chunk in keys.chunks(backend.capacity) {
             let mut addresses = vec![[0; 20]; chunk.len()];
             backend.derive_batch(chunk, &mut addresses)?;

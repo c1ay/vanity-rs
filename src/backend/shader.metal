@@ -13,6 +13,9 @@ using namespace metal;
 #ifndef OPT_KECCAK
 #define OPT_KECCAK 0
 #endif
+#ifndef INCREMENT_STRIDE
+#define INCREMENT_STRIDE 1
+#endif
 
 // Little-endian 32-bit limbs, canonical modulo p = 2^256 - 2^32 - 977.
 // All scalar-dependent choices below use masks, not branches or table indices.
@@ -295,6 +298,17 @@ inline Point public_jacobian(device const uchar *key, device const uint *table) 
         sum = add_window(sum, x, y, digit);
     }
     return sum;
+}
+
+// Window 0 digit 1 is G in every table layout (4/8/16-bit). Host chains stay in
+// [2, n-1], so P+G never hits the mixed-add doubling/infinity exceptions.
+inline Point add_generator(Point p, device const uint *table) {
+    Fe gx, gy;
+    for (uint limb = 0; limb < 8; ++limb) {
+        gx.v[limb] = table[16 + limb];
+        gy.v[limb] = table[24 + limb];
+    }
+    return add_window(p, gx, gy, 1u);
 }
 
 inline Point to_affine(Point sum) {
@@ -602,6 +616,23 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
                                    device uchar *addresses [[buffer(2)]],
                                    constant uint &count [[buffer(3)]],
                                    uint gid [[thread_position_in_grid]]) {
+#if INCREMENT_STRIDE > 1
+    uint base = gid * INCREMENT_STRIDE;
+    if (base >= count) return;
+    uint chain = min(uint(INCREMENT_STRIDE), count - base);
+    Point p = public_jacobian(keys + base * 32, table);
+    for (uint offset = 0; offset < chain; offset += CHUNK_SIZE) {
+        uint n = min(uint(CHUNK_SIZE), chain - offset);
+        Point pts[CHUNK_SIZE];
+        for (uint i = 0; i < CHUNK_SIZE; ++i) {
+            if (i < n) {
+                pts[i] = p;
+                if (offset + i + 1 < chain) p = add_generator(p, table);
+            }
+        }
+        montgomery_chunk_affine_keccak(pts, base + offset, count, addresses);
+    }
+#else
     uint base = gid * CHUNK_SIZE;
     if (base >= count) return;
     Point pts[CHUNK_SIZE];
@@ -610,5 +641,6 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
         if (index < count) pts[i] = public_jacobian(keys + index * 32, table);
     }
     montgomery_chunk_affine_keccak(pts, base, count, addresses);
+#endif
 }
 #endif

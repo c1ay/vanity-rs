@@ -60,3 +60,7 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 ## 双在途 GPU 命令
 
 `AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（仅拆核/threadgroup 求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。
+
+## 增量点加（默认 stride=32）
+
+融合 kernel 对每条链只做一次 `public_jacobian`，随后 `INCREMENT_STRIDE-1` 次 `P += G`（G 取自窗口 0 digit 1）。主机为每条链抽一个 CSPRNG 起点，再递增标量；链落在 `[2, n-1]`，避免 mixed-add 的倍点/无穷点例外。`VANITY_BENCH_STRIDE=1` 回到每地址一次标量乘。Dispatch 宽度为 `ceil(count / stride)`。CPU 后端仍逐钥 `from_secret_key`，不走增量。
