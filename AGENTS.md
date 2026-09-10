@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `src/main.rs` — CLI, progress UI, and file output.
-- `src/backend/` — address derivation: CPU (`cpu.rs`), Apple Silicon Metal (`metal.rs`, `shader.metal`), CUDA (`cuda.rs`, `shader.cu`, `shader.ptx`), and Vulkan (`vulkan.rs`, `shader.comp`, `shader.spv`). Shared fixed-base table construction lives in `table.rs`. Backends fill address slices from valid chain-start `SecretKey` batches (one start per `increment_stride()` addresses); they do not match, rank, or write files.
+- `src/backend/` — address derivation: CPU (`cpu.rs`), Apple Silicon Metal (`metal.rs`, `shader.metal`), CUDA (`cuda.rs`, `shader.cu`, `shader.ptx`), and Vulkan (`vulkan.rs`, `shader.comp`, `shader.spv`). Shared fixed-base table construction lives in `table.rs`. Backends fill address slices from valid chain-start `SecretKey` batches (one start per `increment_stride()` addresses). Metal may keep affine chain points across batches and step by `stride·G`; CUDA/Vulkan still expand starts on the host. Backends do not match, rank, or write files.
 - `src/search.rs` and `src/search/pipeline.rs` — CSPRNG, increment chains, matching, ranking, cancellation, and optional GPU key-prep overlap.
 - `src/timing.rs` — optional stage timing for benchmarks.
 - `tests/cli.rs` — binary-level output, permissions, and persistence checks.

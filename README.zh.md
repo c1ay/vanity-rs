@@ -18,9 +18,9 @@ cargo run --release -- --backend cpu --workers 14 --suffix abc
 
 Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证。CUDA 运行时动态加载 NVIDIA 驱动（`libcuda.so.1` / `nvcuda.dll`），macOS 上跳过以免与 Metal 争用，编译和运行都不需要 CUDA Toolkit 或 `nvcc`。Vulkan 在所有平台编译，运行时动态加载系统 Vulkan loader（`libvulkan.so.1` / `vulkan-1.dll`），macOS 上跳过以免与 Metal 争用。没有可用 GPU 的平台保留 CPU 实现。MSL 源码嵌入程序并在启动时编译；CUDA 使用预编译 PTX（`src/backend/shader.ptx`，可用 `nvcc -ptx -arch=compute_60 -o src/backend/shader.ptx src/backend/shader.cu` 重建）；Vulkan 使用预编译 SPIR-V（`src/backend/shader.spv`，可用 `glslangValidator -V --target-env vulkan1.1 -o src/backend/shader.spv src/backend/shader.comp` 重建）。首次启动包括建表及已知向量自检。
 
-`--workers` 只控制 CPU 线程数；GPU 模式传入该参数会提示忽略。`--gpu-batch-size` 默认 **262144**，支持 **1–262144**。M4 Pro 上 Metal 路径使用 16-bit 固定基窗口、两个在途 GPU 命令，以及步长 32 的仿射批量加增量链（每链一次 `k·G`，随后从固定基表取 `i·G` 做 `P0 + i·G`，整链只做一次有限域求逆）。上一版内核最后一次干净测量约为 **2900 万地址/秒**；当前内核在与另一搜索进程共享 GPU 的条件下测得约 **5500 万地址/秒**，无争用数据待补（见 [性能报告](docs/performance-m4-pro.md#链起点上传与仿射批量加2026-09-10)）。没有启动时自动调优。
+`--workers` 只控制 CPU 线程数；GPU 模式传入该参数会提示忽略。`--gpu-batch-size` 默认 **262144**，支持 **1–262144**。M4 Pro 上 Metal 路径使用 16-bit 固定基窗口、两个在途 GPU 命令，以及步长 32 的仿射批量加增量链（每链一次 `k·G`，随后从固定基表取 `i·G` 做 `P0 + i·G`）。第一批之后 GPU 保留仿射链起点并每次加上 `32·G`；Keccak 作为第二核按每地址一线程运行。该配置 12 秒测量约为 **7900 万地址/秒**（见 [性能报告](docs/performance-m4-pro.md)）。没有启动时自动调优。
 
-主机每 32 个地址只生成、上传和擦除一个**链起点**，其余标量由 GPU 推导；CPU 只在命中或候选时重算 `起点 + 偏移`。批次达到 65536 时，程序用一个 CPU 准备线程生成下一批起点，与 GPU 计算重叠；较小批次保持同步路径。有两份主机批次和两套 Metal 输入输出缓冲区（最多两个在途 GPU 命令），不进行 CPU/GPU 混合地址搜索。线程组在 M4 Pro 上继续使用 128；专用平方、快速模加、批量映射和线程组 Montgomery 求逆实验未证明稳定收益，未启用。
+主机每 32 个地址只生成、上传和擦除一个**链起点**；Metal 在后续批次复用这些起点（GPU 保存仿射 `k·G` 再加 `32·G`）。CPU 只在命中或候选时重算 `起点 + 偏移`。CUDA/Vulkan 仍在每批由主机展开起点。批次达到 65536 时，程序用一个 CPU 准备线程生成下一批起点，与 GPU 计算重叠；较小批次保持同步路径。有两份主机批次和两套 Metal 输入输出缓冲区（最多两个在途 GPU 命令），不进行 CPU/GPU 混合地址搜索。线程组在 M4 Pro 上继续使用 128；专用平方、快速模加、批量映射和线程组 Montgomery 求逆实验未证明稳定收益，未启用。
 
 更重视停止响应时可显式使用 `--gpu-batch-size 65536`。双在途融合配置下，65536 停止收尾中位数约为 12ms，262144 约为 40ms；这些是观测值，不是最坏情况保证。完整配对结果见 [性能报告](docs/performance-m4-pro.md#窗口位宽与拆核融合2026-08-28第四轮测量)。
 
@@ -33,7 +33,7 @@ Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证。CUDA 运行时动
 `backend::AddressBackend` 接收有效的链起点 `SecretKey` 切片（每 `increment_stride()` 个地址一个；地址 `j` 对应 `keys[j / stride] + j % stride`），填写 20 字节地址切片。调用成功表示整批完成；失败时输出不可使用。后端不处理匹配条件、进度条或文件。
 
 - `backend::cpu` 使用 libsecp256k1 与 tiny-keccak；CPU 工作线程以单元素批次静态分派，保留流式计算方式。
-- `backend::metal` 管理设备、运行时编译、共享缓冲区及同步。MSL 执行精确整数有限域运算、固定窗口基点乘法和 Ethereum Keccak-256。
+- `backend::metal` 管理设备、运行时编译、共享缓冲区及同步。MSL 执行精确整数有限域运算、固定窗口基点乘法、Ethereum Keccak-256，以及跨批次的仿射链点驻留。
 - `backend::cuda` 管理 CUDA 上下文、预编译 PTX、双 stream 和 event。CUDA 内核对应上一版 Metal 路径（16-bit 窗口、融合 `P += G` 链与分块求逆、线程块 128），仍按每地址读取一个标量，因此主机在上传前展开链起点。需要 NVIDIA 驱动，计算能力 6.0 及以上。
 - `backend::vulkan` 管理实例、设备、预编译 SPIR-V、主机可见槽位和 fence。GLSL 内核与 CUDA 路径一致（16-bit 窗口、融合分块求逆、主机展开密钥）。NVIDIA/Intel 的 Vulkan 设备也可能能跑，验证目标是 AMD。
 - `search` 共用随机数生成、匹配、候选排名、计数及取消逻辑。GPU 仅用一个调度线程；大批次另用一个线程准备私钥，不与 CPU 地址搜索混跑。
@@ -43,7 +43,7 @@ Metal 目前在 macOS ARM64 上启用，已在 M4 Pro 验证。CUDA 运行时动
 
 ## 私钥与正确性
 
-各工作线程使用 OsRng 播种 ChaCha20Rng，并通过拒绝采样生成有效私钥。GPU 搜索从每个 CSPRNG 起点走一小段递增链（默认 `k, k+1, …, k+31`），内核用 `P0 + i·G` 代替重复标量乘。起点若满足 `k < 链长` 或 `k + 链长 - 1 > n - 1` 会被拒绝重抽——这正是不完整加法公式的倍点/无穷点例外（单次概率约 2^-250）。没有从低熵起点扫描，也没有生产环境固定种子开关。
+各工作线程使用 OsRng 播种 ChaCha20Rng，并通过拒绝采样生成有效私钥。GPU 搜索从每个 CSPRNG 起点走一小段递增链（默认 `k, k+1, …, k+31`），内核用 `P0 + i·G` 代替重复标量乘。Metal 随后在 GPU 上保留这些链点，后续批次继续 `k+32, k+33, …`。起点若满足 `k < 链长` 或 `k + 链长 - 1 > n - 1` 会被拒绝重抽——这正是不完整加法公式的倍点/无穷点例外（单次概率约 2^-250）。持久化链还要求能再加 `stride·G`，并预留约 2^20 批的余量。没有从低熵起点扫描，也没有生产环境固定种子开关。
 
 GPU 启动时执行已知向量自检，每批轮换抽样一项由 CPU 复算；每个准备发布的命中或最佳候选还要独立复算地址。匹配始终使用同一套 Rust 逻辑。任何校验失败都停止搜索，不发布该批候选。计算和持久化错误会停止新批次提交，等待在途任务结束后返回错误。
 
@@ -89,7 +89,7 @@ VANITY_BENCH_BACKEND=vulkan VANITY_BENCH_BATCH=262144 \
   cargo test --release --bin vanity-rs benchmark_backends -- --ignored --nocapture
 ```
 
-这些环境变量只供测试程序使用。基准文件仅记录计数和时间，不保留生成的私钥。诊断计时可用 `VANITY_BENCH_PROFILE=1`；`VANITY_BENCH_PIPELINE=0|1` 可做同步/流水线对照。其余实验开关为 `VANITY_BENCH_BULK=0|1`、`VANITY_BENCH_ADD=0|1`、`VANITY_BENCH_SQUARE=0|1`、`VANITY_BENCH_GROUP=auto|32|64|128|256`、`VANITY_BENCH_INVERT=0|1`、`VANITY_BENCH_WINDOW=4|8|16`、`VANITY_BENCH_INFLIGHT=1|2`、`VANITY_BENCH_CHUNK=0|4|8|16|32`、`VANITY_BENCH_KECCAK=0|1`、`VANITY_BENCH_FUSE=0|1`、`VANITY_BENCH_STRIDE=1|8|16|32|64` 和 `VANITY_BENCH_AFFINE=0|1`，普通程序不读取这些开关。正式吞吐比较应关闭诊断计时。
+这些环境变量只供测试程序使用。基准文件仅记录计数和时间，不保留生成的私钥。诊断计时可用 `VANITY_BENCH_PROFILE=1`；`VANITY_BENCH_PIPELINE=0|1` 可做同步/流水线对照。其余实验开关为 `VANITY_BENCH_BULK=0|1`、`VANITY_BENCH_ADD=0|1`、`VANITY_BENCH_SQUARE=0|1`、`VANITY_BENCH_GROUP=auto|32|64|128|256`、`VANITY_BENCH_INVERT=0|1`、`VANITY_BENCH_WINDOW=4|8|16`、`VANITY_BENCH_INFLIGHT=1|2`、`VANITY_BENCH_CHUNK=0|4|8|16|32`、`VANITY_BENCH_KECCAK=0|1`、`VANITY_BENCH_FUSE=0|1`、`VANITY_BENCH_STRIDE=1|8|16|32|64`、`VANITY_BENCH_AFFINE=0|1`、`VANITY_BENCH_KSPLIT=0|1`、`VANITY_BENCH_PERSIST=0|1` 和 `VANITY_BENCH_SIMD=0|1`，普通程序不读取这些开关。正式吞吐比较应关闭诊断计时。
 
 所有实验的冻结源码、二进制、配置、哈希、日志和原始数据保存在独立的 `target/gpu-optimization/20260828-m4-stages/`，没有覆盖旧实验。设计和整数上界证明见 [实现说明](docs/gpu-optimization-design.md)。
 

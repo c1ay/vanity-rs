@@ -151,6 +151,10 @@ fn run_with_rng<B: AddressBackend>(
 trait KeySource {
     fn next(&mut self, stop: &AtomicBool) -> Result<Option<&[SecretKey]>>;
     fn recycle(&mut self, stop: &AtomicBool) -> Result<()>;
+    /// True when `next` returned starts already on the GPU (Metal should step).
+    fn resume(&self) -> bool {
+        false
+    }
 }
 
 struct SequentialSource<'a, R, O> {
@@ -171,6 +175,7 @@ impl<R: RngCore + CryptoRng, O: Observer> KeySource for SequentialSource<'_, R, 
             self.size,
             self.stride,
             Some(stop),
+            false,
         );
         self.observer.finish(Stage::Prepare, started);
         Ok((!stop.load(Ordering::Relaxed)).then_some(&self.keys.0))
@@ -362,8 +367,10 @@ fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
             let Some(keys) = source.next(context.stop)? else {
                 break;
             };
-            backend.begin_batch(keys, batch_size)?;
-            held.push_back(clone_key_batch(keys)?);
+            let copied = clone_key_batch(keys)?;
+            let resume = source.resume();
+            backend.begin_resumed(&copied.0, batch_size, resume)?;
+            held.push_back(copied);
             source.recycle(context.stop)?;
         }
         let Some(keys) = held.pop_front() else {
@@ -671,10 +678,14 @@ pub(crate) fn fill_secret_keys(
     size: usize,
     stride: usize,
     stop: Option<&AtomicBool>,
+    persist: bool,
 ) -> bool {
     let stride = stride.max(1);
     let chains = chain_count(size, stride);
     keys.truncate(chains);
+    let headroom = persist
+        .then(|| stride.saturating_mul(crate::backend::PERSIST_HEADROOM_BATCHES))
+        .filter(|&span| span > 0);
     for chain in 0..chains {
         let first = chain * stride;
         if chain > 0
@@ -684,9 +695,15 @@ pub(crate) fn fill_secret_keys(
             return false;
         }
         let len = (size - first).min(stride);
+        // Persist stores (k+len)·G, so reject the +len doubling/infinity cases.
+        let accept_len = if persist && len > 1 { len + 1 } else { len };
         let start = loop {
             let candidate = generate_secret_key(rng);
-            if crate::backend::chain_start_accepted(&candidate, len) {
+            if crate::backend::chain_start_accepted(&candidate, accept_len)
+                && headroom.is_none_or(|span| {
+                    crate::backend::offset_secret_key(&candidate, span).is_some()
+                })
+            {
                 break candidate;
             }
         };
@@ -908,7 +925,7 @@ mod tests {
     fn fill_secret_keys_emits_one_accepted_start_per_chain() {
         let mut rng = ChaCha20Rng::from_seed([23; 32]);
         let mut keys = Vec::new();
-        assert!(fill_secret_keys(&mut rng, &mut keys, 40, 32, None));
+        assert!(fill_secret_keys(&mut rng, &mut keys, 40, 32, None, false));
         assert_eq!(keys.len(), 2);
         assert!(crate::backend::chain_start_accepted(&keys[0], 32));
         assert!(crate::backend::chain_start_accepted(&keys[1], 8));
@@ -921,7 +938,7 @@ mod tests {
             crate::backend::increment_secret_key(&keys[1]).unwrap()
         );
         // Refilling a shorter batch reuses and truncates the storage.
-        assert!(fill_secret_keys(&mut rng, &mut keys, 32, 32, None));
+        assert!(fill_secret_keys(&mut rng, &mut keys, 32, 32, None, false));
         assert_eq!(keys.len(), 1);
         let mut independent = Vec::new();
         let mut expected = ChaCha20Rng::from_seed([23; 32]);
@@ -930,7 +947,8 @@ mod tests {
             &mut independent,
             3,
             1,
-            None
+            None,
+            false
         ));
         assert_eq!(independent.len(), 3);
         assert_eq!(independent[0], generate_secret_key(&mut expected));
@@ -970,7 +988,8 @@ mod tests {
             &mut keys,
             32,
             32,
-            None
+            None,
+            false
         ));
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].secret_bytes(), fits);
@@ -981,7 +1000,8 @@ mod tests {
             &mut single,
             1,
             32,
-            None
+            None,
+            false
         ));
         assert_eq!(single[0].secret_bytes(), one);
     }

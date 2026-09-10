@@ -19,6 +19,12 @@ using namespace metal;
 #ifndef OPT_AFFINE
 #define OPT_AFFINE 0
 #endif
+#ifndef OPT_PERSIST
+#define OPT_PERSIST 0
+#endif
+#ifndef OPT_SIMD
+#define OPT_SIMD 0
+#endif
 
 // Little-endian 32-bit limbs, canonical modulo p = 2^256 - 2^32 - 977.
 // All scalar-dependent choices below use masks, not branches or table indices.
@@ -213,6 +219,45 @@ inline Fe fe_inverse(Fe a) {
     t = fe_mul(fe_squares(t, 3), x2);
     return fe_mul(fe_squares(t, 2), a);
 }
+#if OPT_SIMD
+// Shuffle each limb: Metal simd_* operate on scalars, not on Fe.
+inline Fe fe_simd_shuffle(Fe a, uint lane) {
+    Fe r;
+    for (uint i = 0; i < 8; ++i) r.v[i] = simd_shuffle(a.v[i], ushort(lane));
+    return r;
+}
+inline Fe fe_simd_shuffle_up(Fe a, uint delta) {
+    Fe r;
+    for (uint i = 0; i < 8; ++i) r.v[i] = simd_shuffle_up(a.v[i], ushort(delta));
+    return r;
+}
+inline Fe fe_simd_shuffle_down(Fe a, uint delta) {
+    Fe r;
+    for (uint i = 0; i < 8; ++i) r.v[i] = simd_shuffle_down(a.v[i], ushort(delta));
+    return r;
+}
+// One fe_inverse per simdgroup (32 lanes on Apple GPUs). Inactive lanes pass 1.
+// inv(z_i) = inv(∏ z) · (∏_{j<i} z_j) · (∏_{j>i} z_j). Dispatch width is rounded
+// up so every simdgroup is full; a partial group would leave shuffle lanes empty.
+inline Fe simdgroup_invert(Fe z, uint lane, uint width) {
+    Fe prefix = z;
+    for (uint step = 1; step < width; step *= 2) {
+        Fe up = fe_simd_shuffle_up(prefix, step);
+        prefix = fe_select(prefix, fe_mul(prefix, up), mask_if(lane >= step));
+    }
+    Fe total = fe_simd_shuffle(prefix, width - 1);
+    Fe inv_total = (lane + 1 == width) ? fe_inverse(total) : fe_zero();
+    inv_total = fe_simd_shuffle(inv_total, width - 1);
+    Fe suffix = z;
+    for (uint step = 1; step < width; step *= 2) {
+        Fe down = fe_simd_shuffle_down(suffix, step);
+        suffix = fe_select(suffix, fe_mul(suffix, down), mask_if(lane + step < width));
+    }
+    Fe pref_ex = fe_select(fe_one(), fe_simd_shuffle_up(prefix, 1), mask_if(lane != 0));
+    Fe suff_ex = fe_select(fe_one(), fe_simd_shuffle_down(suffix, 1), mask_if(lane + 1 < width));
+    return fe_mul(fe_mul(pref_ex, suff_ex), inv_total);
+}
+#endif
 
 inline Point point_select(Point a, Point b, uint mask) {
     Point r = {fe_select(a.x, b.x, mask), fe_select(a.y, b.y, mask), fe_select(a.z, b.z, mask)};
@@ -670,43 +715,83 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
 // e_i/zzz, hence lambda_i = e_i / (Z*d_i) = e_i * inv(d_i) * inv(Z).
 // Exceptions (P0 = ±i*G, i.e. k = i or k + i = n) are excluded by the host
 // rule chain_start_accepted: k >= chain length and k + chain - 1 <= n - 1.
-// Chain scalars are host-validated, so d_i is never zero here.
-kernel void chain_affine_addresses(device const uchar *keys [[buffer(0)]],
-                                   device const uint *table [[buffer(1)]],
-                                   device uchar *addresses [[buffer(2)]],
-                                   constant uint &count [[buffer(3)]],
-                                   uint gid [[thread_position_in_grid]]) {
+// Persist adds S*G to store the next start, so the host also requires
+// k >= S+1 and k+S <= n-1 (accepted length S+1). Chain scalars are
+// host-validated, so d_i is never zero here.
+// `emit(index, x, y)` receives every affine point of the chain owned by `gid`.
+template <typename Emit>
+inline void chain_affine(device const uchar *keys, device const uint *table,
+                         device uint *state, uint resume, uint count, uint gid,
+                         uint lane, uint sg, Emit emit) {
+#if !OPT_PERSIST
+    (void)state;
+    (void)resume;
+#endif
     uint base = gid * INCREMENT_STRIDE;
-    if (base >= count) return; // public batch boundary
-    uint chain = min(uint(INCREMENT_STRIDE), count - base);
-    Point p = public_jacobian(keys + gid * 32, table);
+    bool active = base < count;
+    uint chain = active ? min(uint(INCREMENT_STRIDE), count - base) : 0;
+    Point p;
+    if (active) {
+#if OPT_PERSIST
+        if (resume) {
+            // Previous batch stored affine (k)*G; Z = 1 simplifies d_i = gx_i - X.
+            p.x = load_fe(state + gid * 16);
+            p.y = load_fe(state + gid * 16 + 8);
+            p.z = fe_one();
+        } else
+#endif
+        {
+            p = public_jacobian(keys + gid * 32, table);
+        }
+    } else {
+        p = {fe_one(), fe_one(), fe_one()};
+    }
     Fe zz = fe_square(p.z);
     Fe zzz = fe_mul(p.z, zz);
 
-    // prefix[i] = d_1 * ... * d_i (prefix[0] = 1); padding lanes contribute 1.
+    // prefix[i] = d_1 * ... * d_i (prefix[0] = 1). Persist also folds d_S so the
+    // reverse walk can materialize (k+S)*G without a second inversion.
+#if OPT_PERSIST
+    const uint bound = INCREMENT_STRIDE;
+    Fe prefix[INCREMENT_STRIDE + 1];
+#else
+    const uint bound = INCREMENT_STRIDE - 1;
     Fe prefix[INCREMENT_STRIDE];
+#endif
     Fe acc = fe_one();
     prefix[0] = acc;
-    for (uint i = 1; i < INCREMENT_STRIDE; ++i) {
-        if (i < chain) {
+    for (uint i = 1; i <= bound; ++i) {
+        bool take = active && (i < chain || (i == INCREMENT_STRIDE && chain == INCREMENT_STRIDE));
+        if (take) {
             Fe gx = load_fe(table + i * 16);
             acc = fe_mul(acc, fe_sub(fe_mul(gx, zz), p.x));
         }
         prefix[i] = acc;
     }
     // One inversion for Z and every d_i: inv(Z * prod d) -> inv(Z), inv(prod d).
-    Fe inv = fe_inverse(fe_mul(acc, p.z));
+    Fe local = active ? fe_mul(acc, p.z) : fe_one();
+#if OPT_SIMD
+    // Partial simdgroups keep per-chain inverses: padded lanes would otherwise
+    // participate in shuffles with inactive neighbors.
+    Fe inv = simd_all(active) ? simdgroup_invert(local, lane, sg) : fe_inverse(local);
+#else
+    (void)lane;
+    (void)sg;
+    Fe inv = fe_inverse(local);
+#endif
     Fe zinv = fe_mul(inv, acc);
     inv = fe_mul(inv, p.z);
 
     Fe zzinv = fe_square(zinv);
-    Point p0 = {fe_mul(p.x, zzinv), fe_mul(p.y, fe_mul(zzinv, zinv)), fe_one()};
-    eth_address(p0, addresses + base * 20);
+    Fe x0 = fe_mul(p.x, zzinv);
+    Fe y0 = fe_mul(p.y, fe_mul(zzinv, zinv));
+    if (active) emit(base, x0, y0);
 
     // Walk back: before step i, inv = inv(prefix[i]); prefix[i-1] * inv isolates
     // inv(d_i), then multiplying by d_i moves inv to prefix[i-1].
-    for (uint i = INCREMENT_STRIDE; i-- > 1; ) {
-        if (i < chain) {
+    for (uint i = bound + 1; i-- > 1; ) {
+        bool take = active && (i < chain || (i == INCREMENT_STRIDE && chain == INCREMENT_STRIDE));
+        if (take) {
             Fe gx = load_fe(table + i * 16);
             Fe gy = load_fe(table + i * 16 + 8);
             Fe d = fe_sub(fe_mul(gx, zz), p.x);
@@ -714,12 +799,87 @@ kernel void chain_affine_addresses(device const uchar *keys [[buffer(0)]],
             Fe dinv = fe_mul(inv, prefix[i - 1]);
             inv = fe_mul(inv, d);
             Fe lambda = fe_mul(fe_mul(e, dinv), zinv);
-            Point q;
-            q.x = fe_sub(fe_sub(fe_square(lambda), p0.x), gx);
-            q.y = fe_sub(fe_mul(lambda, fe_sub(p0.x, q.x)), p0.y);
-            q.z = fe_one();
-            eth_address(q, addresses + (base + i) * 20);
+            Fe x = fe_sub(fe_sub(fe_square(lambda), x0), gx);
+            Fe y = fe_sub(fe_mul(lambda, fe_sub(x0, x)), y0);
+#if OPT_PERSIST
+            if (i == INCREMENT_STRIDE) {
+                store_fe(state + gid * 16, x);
+                store_fe(state + gid * 16 + 8, y);
+            } else
+#endif
+            {
+                emit(base + i, x, y);
+            }
         }
     }
+}
+
+// Fused: hash every point as soon as it is known (one thread per chain).
+struct EmitAddress {
+    device uchar *addresses;
+    void operator()(uint index, Fe x, Fe y) const {
+        Point q = {x, y, fe_one()};
+        eth_address(q, addresses + index * 20);
+    }
+};
+kernel void chain_affine_addresses(device const uchar *keys [[buffer(0)]],
+                                   device const uint *table [[buffer(1)]],
+                                   device uchar *addresses [[buffer(2)]],
+                                   constant uint &count [[buffer(3)]],
+#if OPT_PERSIST
+                                   device uint *state [[buffer(4)]],
+                                   constant uint &resume [[buffer(5)]],
+#endif
+                                   uint gid [[thread_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint sg [[threads_per_simdgroup]]) {
+    EmitAddress emit = {addresses};
+#if OPT_PERSIST
+    chain_affine(keys, table, state, resume, count, gid, lane, sg, emit);
+#else
+    chain_affine(keys, table, nullptr, 0, count, gid, lane, sg, emit);
+#endif
+}
+
+// Split: the chain kernel stores affine coordinates (64 bytes per address),
+// and keccak_points hashes them with one thread per address. Keccak-f[1600]
+// is more than half of the address cost; running it at full width with a
+// small register footprint, instead of inside the chain thread that also
+// holds prefix[INCREMENT_STRIDE], is a measured occupancy tradeoff.
+struct EmitPoint {
+    device uint *points;
+    void operator()(uint index, Fe x, Fe y) const {
+        store_fe(points + index * 16, x);
+        store_fe(points + index * 16 + 8, y);
+    }
+};
+kernel void chain_affine_points(device const uchar *keys [[buffer(0)]],
+                                device const uint *table [[buffer(1)]],
+                                device uint *points [[buffer(2)]],
+                                constant uint &count [[buffer(3)]],
+#if OPT_PERSIST
+                                device uint *state [[buffer(4)]],
+                                constant uint &resume [[buffer(5)]],
+#endif
+                                uint gid [[thread_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[threads_per_simdgroup]]) {
+    EmitPoint emit = {points};
+#if OPT_PERSIST
+    chain_affine(keys, table, state, resume, count, gid, lane, sg, emit);
+#else
+    chain_affine(keys, table, nullptr, 0, count, gid, lane, sg, emit);
+#endif
+}
+
+kernel void keccak_points(device const uint *points [[buffer(0)]],
+                          device const uint *unused [[buffer(1)]],
+                          device uchar *addresses [[buffer(2)]],
+                          constant uint &count [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    (void)unused;
+    if (gid >= count) return; // public batch boundary
+    Point q = {load_fe(points + gid * 16), load_fe(points + gid * 16 + 8), fe_one()};
+    eth_address(q, addresses + gid * 20);
 }
 #endif

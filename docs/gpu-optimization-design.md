@@ -82,3 +82,15 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 - 反向展开：`d_i⁻¹ = inv·prefix[i-1]`，`inv ← inv·d_i`；`x_i = λ² - x0 - gx_i`，`y_i = λ(x0 - x_i) - y0`。`d_i`、`e_i` 反向时重算（各 1 次乘），换取只存 `prefix[S]`（256 uint，与 chunk-8 路径的 `pts[8]+prefix[8]` 相当）。
 
 每地址约 11 次域乘 + `fe_inverse/32`，对照 `P += G` 路径的 11（mixed add）+ ~34（chunk-8 求逆分摊）+ 6（仿射化）。整链域乘约 1790 → 约 800。例外由主机起点规则排除，kernel 不再做零 Z / 零 d 掩码；错误地址只会浪费工作，命中与候选仍经 CPU 复核。差分测试覆盖 stride 8/32/64、8/16-bit 窗口与全部批次尾部，并与 `affine=false` 的旧路径同批对照。
+
+## 链点驻留（默认，`OPT_PERSIST=1`）
+
+第一批仍从密钥做 `public_jacobian`。kernel 把 `d_S` 一并纳入 Montgomery 乘积，反向展开时把仿射 `(k+S)·G` 写入每槽 64 字节的 state 缓冲（不是密钥）。后续 `begin_resumed(..., resume=true)` 不再上传标量，从 state 读 Z=1 的 P0，再走同一套 `P0 + i·G`。主机 pipeline 把同一套链起点按 stride 进位；进位失败则重抽并重新 init。`derive_batch` 始终 `resume=false`，测试与自检不受驻留影响。接受规则加严为 `chain_start_accepted(k, stride+1)`（排除 `k=S` 的倍点与 `k+S=n` 的无穷点），并要求约 `2^20` 批的余量。CUDA/Vulkan 忽略 resume，每批仍从当前起点展开。
+
+## simdgroup 求逆（默认，`OPT_SIMD=1`）
+
+每条链仍累积自己的 `Z·∏d_i`。32 宽 simdgroup 做前后缀积，只在 lane 31 调用一次 `fe_inverse`，再 shuffle 回各 lane。Dispatch 宽度上取整到 32，空 lane 贡献 1。这与已否决的 threadgroup 串行求逆不同：后者把整组压在 lane 0，这里是并行 scan。`VANITY_BENCH_SIMD=0` 回到每链一次求逆。
+
+## 拆核 Keccak（默认，`VANITY_BENCH_KSPLIT=1`）
+
+`chain_affine_points` 只写仿射坐标（64 字节/地址），`keccak_points` 每地址一个线程做哈希，避免 Keccak 状态与 `prefix[S]` 挤在同一线程的寄存器里。12 秒交错测量约 +31%（60.3M → 79.3M 地址/秒）。`VANITY_BENCH_KSPLIT=0` 回到融合路径。位交错 Keccak 叠在拆核上约 +3%，未达稳定保留门槛，默认仍关。

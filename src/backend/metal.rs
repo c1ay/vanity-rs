@@ -22,10 +22,13 @@ use crate::timing::{Noop, Observer, Stage};
 // threadgroup candidates from earlier rounds stay off; threadgroup Montgomery
 // invert was measured and rejected. Defaults that passed the retention gate:
 // two in-flight GPU commands, 16-bit fixed-base windows, increment chains of
-// 32 with affine batched addition (one inversion per chain). The fused
-// Jacobian P += G kernel with per-thread chunked inversion (chunk = 8) stays
-// as the `affine = false` comparison path. Bit-interleaved Keccak stayed
-// within noise and remains off.
+// 32 with affine batched addition. After the first batch the GPU keeps affine
+// chain starts and steps by stride·G (no windowed scalar mul); one fe_inverse
+// is shared across a 32-lane simdgroup when the group is full. Keccak runs as
+// a second kernel at one thread per address (split from the chain kernel).
+// The fused Jacobian P += G kernel with per-thread chunked inversion (chunk =
+// 8) stays as the `affine = false` comparison path. Bit-interleaved Keccak
+// stays off.
 #[derive(Clone, Copy)]
 pub(crate) struct MetalConfig {
     pub(crate) bulk: bool,
@@ -40,6 +43,13 @@ pub(crate) struct MetalConfig {
     pub(crate) fuse: bool,
     pub(crate) stride: u8,
     pub(crate) affine: bool,
+    /// Affine chain points go to a scratch buffer and Keccak runs as a second
+    /// kernel with one thread per address (requires `affine`).
+    pub(crate) split_keccak: bool,
+    /// Keep affine (k+S)·G on the GPU and skip scalar mul on later batches.
+    pub(crate) persist: bool,
+    /// Invert one product per simdgroup instead of per chain.
+    pub(crate) simd: bool,
 }
 
 impl Default for MetalConfig {
@@ -57,6 +67,9 @@ impl Default for MetalConfig {
             fuse: true,
             stride: super::DEFAULT_INCREMENT_STRIDE as u8,
             affine: true,
+            split_keccak: true,
+            persist: true,
+            simd: true,
         }
     }
 }
@@ -114,6 +127,27 @@ impl MetalConfig {
         );
         Ok(())
     }
+
+    fn persist_enabled(&self) -> bool {
+        self.persist && self.affine
+    }
+
+    fn simd_enabled(&self) -> bool {
+        self.simd && self.affine
+    }
+
+    fn split_keccak_enabled(&self) -> bool {
+        self.split_keccak && self.affine
+    }
+    fn scratch_bytes(&self) -> usize {
+        if self.invert || (self.chunk > 0 && !self.fuse) {
+            96 // Jacobian X, Y, Z
+        } else if self.split_keccak_enabled() {
+            64 // affine x, y
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +162,9 @@ impl MetalConfig {
             ("VANITY_BENCH_KECCAK", &mut config.keccak),
             ("VANITY_BENCH_FUSE", &mut config.fuse),
             ("VANITY_BENCH_AFFINE", &mut config.affine),
+            ("VANITY_BENCH_KSPLIT", &mut config.split_keccak),
+            ("VANITY_BENCH_PERSIST", &mut config.persist),
+            ("VANITY_BENCH_SIMD", &mut config.simd),
         ] {
             if let Ok(value) = std::env::var(name) {
                 *setting = match value.as_str() {
@@ -171,6 +208,15 @@ impl MetalConfig {
                 || (1usize << config.window_bits) <= config.stride as usize)
         {
             config.affine = false;
+        }
+        if !config.affine && std::env::var("VANITY_BENCH_KSPLIT").is_err() {
+            config.split_keccak = false;
+        }
+        if !config.affine && std::env::var("VANITY_BENCH_PERSIST").is_err() {
+            config.persist = false;
+        }
+        if !config.affine && std::env::var("VANITY_BENCH_SIMD").is_err() {
+            config.simd = false;
         }
         config.validate()?;
         Ok(config)
@@ -320,9 +366,14 @@ struct GpuSlot {
     input: SharedBuffer,
     output: SharedBuffer,
     xyz: Option<SharedBuffer>,
+    /// Affine (k)·G for the next batch when persist is on. Not secret.
+    state: Option<SharedBuffer>,
     command: Option<CommandCompletion>,
     /// Addresses requested by the in-flight command; `end` must match it.
     count: usize,
+    /// GPU chain points match this address count; step only when it repeats.
+    persist_count: usize,
+    warm: bool,
 }
 
 pub(crate) struct MetalBackend {
@@ -334,6 +385,8 @@ pub(crate) struct MetalBackend {
     jacobian: Option<Object<dyn MTLComputePipelineState>>,
     invert_pipeline: Option<Object<dyn MTLComputePipelineState>>,
     chunk_pipeline: Option<Object<dyn MTLComputePipelineState>>,
+    /// Second pass of the split Keccak path (`keccak_points`).
+    keccak_pipeline: Option<Object<dyn MTLComputePipelineState>>,
     slots: Vec<GpuSlot>,
     collect_at: usize,
     pending: usize,
@@ -360,7 +413,7 @@ impl MetalBackend {
                 return Ok(None);
             };
             let mut source = format!(
-                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n#define INCREMENT_STRIDE {}\n#define OPT_AFFINE {}\n{}",
+                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n#define INCREMENT_STRIDE {}\n#define OPT_AFFINE {}\n#define OPT_PERSIST {}\n#define OPT_SIMD {}\n{}",
                 u8::from(config.square),
                 u8::from(config.fast_add),
                 u8::from(config.invert),
@@ -369,6 +422,8 @@ impl MetalBackend {
                 u8::from(config.keccak),
                 config.stride,
                 u8::from(config.affine),
+                u8::from(config.persist_enabled()),
+                u8::from(config.simd_enabled()),
                 include_str!("shader.metal")
             );
             // Diagnostic entry points are not included in production binaries.
@@ -395,7 +450,9 @@ impl MetalBackend {
                     pipeline_with_group(
                         &device,
                         &library,
-                        if config.affine {
+                        if config.split_keccak_enabled() {
+                            "chain_affine_points"
+                        } else if config.affine {
                             "chain_affine_addresses"
                         } else if config.fuse {
                             "chunk_derive_addresses"
@@ -406,6 +463,10 @@ impl MetalBackend {
                     )
                 })
                 .transpose()?;
+            let keccak_pipeline = config
+                .split_keccak_enabled()
+                .then(|| pipeline_with_group(&device, &library, "keccak_points", config.group))
+                .transpose()?;
             let queue = device
                 .newCommandQueue()
                 .context("Metal command queue unavailable")?;
@@ -415,16 +476,23 @@ impl MetalBackend {
             populate_table(&mut table, &verifier, config.window_bits)?;
             // Input holds chain starts only: capacity/stride scalars, not one per address.
             let key_slots = chain_count(capacity, config.effective_stride());
+            let scratch = config.scratch_bytes();
             let mut slots = Vec::with_capacity(config.inflight as usize);
             for _ in 0..config.inflight {
                 slots.push(GpuSlot {
                     input: SharedBuffer::new(&device, key_slots * 32, true)?,
                     output: SharedBuffer::new(&device, capacity * 20, false)?,
-                    xyz: split
-                        .then(|| SharedBuffer::new(&device, capacity * 96, false))
+                    xyz: (scratch > 0)
+                        .then(|| SharedBuffer::new(&device, capacity * scratch, false))
+                        .transpose()?,
+                    state: config
+                        .persist_enabled()
+                        .then(|| SharedBuffer::new(&device, key_slots * 64, false))
                         .transpose()?,
                     command: None,
                     count: 0,
+                    persist_count: 0,
+                    warm: false,
                 });
             }
             let mut backend = Self {
@@ -436,6 +504,7 @@ impl MetalBackend {
                 jacobian,
                 invert_pipeline,
                 chunk_pipeline,
+                keccak_pipeline,
                 slots,
                 collect_at: 0,
                 pending: 0,
@@ -576,6 +645,7 @@ fn upload_keys_bulk<'a>(input: &'a mut SharedBuffer, keys: &[SecretKey]) -> Secr
 /// Buffer layouts are defined together with shader.metal: raw 32-byte big-endian
 /// scalars, LE u32 table limbs, packed 20-byte addresses, and a copied u32 count.
 /// `threads` is the dispatch width; chunked kernels use fewer threads than items.
+/// Persist/SIMD chain kernels bind affine state at buffer 4 and a resume flag at 5.
 fn encode_compute(
     command: &ProtocolObject<dyn MTLCommandBuffer>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -583,9 +653,10 @@ fn encode_compute(
     count: usize,
     threads: usize,
     group: Option<usize>,
+    extra: Option<(&SharedBuffer, u32)>,
 ) -> Result<()> {
     ensure!(
-        threads > 0 && threads <= count,
+        threads > 0 && threads <= super::MAX_GPU_BATCH_SIZE as usize,
         "invalid Metal dispatch width"
     );
     let (input, table, output) = buffers;
@@ -606,6 +677,14 @@ fn encode_compute(
             size_of::<u32>(),
             3,
         );
+        if let Some((state, resume)) = extra {
+            encoder.setBuffer_offset_atIndex(Some(&state.object), 0, 4);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&resume).cast::<c_void>(),
+                size_of::<u32>(),
+                5,
+            );
+        }
     }
     let width = pipeline.threadExecutionWidth();
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
@@ -651,7 +730,15 @@ fn dispatch<O: Observer>(
         command,
         submitted: false,
     };
-    encode_compute(&completion.command, pipeline, buffers, count, count, group)?;
+    encode_compute(
+        &completion.command,
+        pipeline,
+        buffers,
+        count,
+        count,
+        group,
+        None,
+    )?;
     completion.complete(observer, encoded)
 }
 
@@ -669,7 +756,15 @@ impl AddressBackend for MetalBackend {
     }
 
     fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
-        self.begin_observed(keys, count, &Noop)
+        self.begin_observed(keys, count, false, &Noop)
+    }
+
+    fn begin_resumed(&mut self, keys: &[SecretKey], count: usize, resume: bool) -> Result<()> {
+        self.begin_observed(keys, count, resume, &Noop)
+    }
+
+    fn persist_increment(&self) -> bool {
+        self.config.persist_enabled() && self.increment_stride() > 1
     }
 
     fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
@@ -684,7 +779,7 @@ impl MetalBackend {
         addresses: &mut [Address],
         observer: &O,
     ) -> Result<()> {
-        self.begin_observed(keys, addresses.len(), observer)?;
+        self.begin_observed(keys, addresses.len(), false, observer)?;
         self.end_observed(keys, addresses, observer)
     }
 
@@ -692,6 +787,7 @@ impl MetalBackend {
         &mut self,
         keys: &[SecretKey],
         count: usize,
+        resume: bool,
         observer: &O,
     ) -> Result<()> {
         ensure!(count <= self.capacity, "batch exceeds Metal capacity");
@@ -712,8 +808,17 @@ impl MetalBackend {
             let invert = self.config.invert;
             let bulk = self.config.bulk;
             let group = self.config.group;
+            let stride = self.increment_stride();
+            let step = resume
+                && self.config.persist_enabled()
+                && self.slots[submit_at].warm
+                && self.slots[submit_at].persist_count == count
+                && stride > 1
+                && count % stride == 0;
             let uploaded = observer.start();
-            write_keys(&mut self.slots[submit_at].input, keys, bulk);
+            if !step {
+                write_keys(&mut self.slots[submit_at].input, keys, bulk);
+            }
             observer.finish(Stage::Upload, uploaded);
             let encoded = observer.start();
             let command = self
@@ -732,20 +837,49 @@ impl MetalBackend {
                     .as_ref()
                     .context("fused path missing chunk pipeline")?;
                 // Increment chains: one thread per chain start (keys.len()).
+                // SIMD invert rounds up to a full simdgroup so shuffles stay defined.
                 // Otherwise one thread per chunk of independent scalars.
-                let threads = if self.config.stride > 1 {
+                let mut threads = if self.config.stride > 1 {
                     keys.len()
                 } else {
                     count.div_ceil(chunk.max(1))
                 };
-                encode_compute(
-                    &completion.command,
-                    pipeline,
-                    (&slot.input, &self.table, &slot.output),
-                    count,
-                    threads,
-                    group,
-                )?;
+                if self.config.simd_enabled() && self.config.stride > 1 {
+                    threads = threads.next_multiple_of(32);
+                }
+                let extra = slot.state.as_ref().map(|state| (state, u32::from(step)));
+                if let Some(keccak) = self.keccak_pipeline.as_ref() {
+                    // Split Keccak: chain points to scratch, then one thread per address.
+                    let points = slot.xyz.as_ref().context("split path missing scratch")?;
+                    encode_compute(
+                        &completion.command,
+                        pipeline,
+                        (&slot.input, &self.table, points),
+                        count,
+                        threads,
+                        group,
+                        extra,
+                    )?;
+                    encode_compute(
+                        &completion.command,
+                        keccak,
+                        (points, &self.table, &slot.output),
+                        count,
+                        count,
+                        group,
+                        None,
+                    )?;
+                } else {
+                    encode_compute(
+                        &completion.command,
+                        pipeline,
+                        (&slot.input, &self.table, &slot.output),
+                        count,
+                        threads,
+                        group,
+                        extra,
+                    )?;
+                }
             } else if invert || chunk > 0 {
                 let jacobian = self
                     .jacobian
@@ -759,6 +893,7 @@ impl MetalBackend {
                     count,
                     count,
                     group,
+                    None,
                 )?;
                 let (second, threads) = if invert {
                     let pipeline = self
@@ -780,6 +915,7 @@ impl MetalBackend {
                     count,
                     threads,
                     group,
+                    None,
                 )?;
             } else {
                 encode_compute(
@@ -789,11 +925,15 @@ impl MetalBackend {
                     count,
                     count,
                     group,
+                    None,
                 )?;
             }
             completion.commit(observer, encoded);
             self.slots[submit_at].command = Some(completion);
             self.slots[submit_at].count = count;
+            self.slots[submit_at].warm =
+                self.config.persist_enabled() && stride > 1 && count % stride == 0;
+            self.slots[submit_at].persist_count = count;
             self.pending += 1;
             Ok(())
         })
@@ -1021,6 +1161,39 @@ mod tests {
         Ok(())
     }
 
+    fn persist_step_differential(backend: &mut MetalBackend, keys: &[SecretKey]) -> Result<()> {
+        let stride = backend.increment_stride();
+        ensure!(
+            backend.persist_increment() && keys.len() >= stride * 2,
+            "persist step requires affine chains"
+        );
+        let count = stride * 2;
+        let starts = super::super::chain_starts(&keys[..count], stride);
+        let mut first = vec![[0; 20]; count];
+        backend.begin_batch(&starts, count)?;
+        backend.end_batch(&starts, &mut first)?;
+        let mut stepped = starts.clone();
+        ensure!(
+            super::super::advance_chain_starts(&mut stepped, stride),
+            "persist test starts must have headroom"
+        );
+        let mut second = vec![[0; 20]; count];
+        backend.begin_resumed(&stepped, count, true)?;
+        backend.end_batch(&stepped, &mut second)?;
+        for (index, address) in second.iter().enumerate() {
+            let key = super::super::chain_key(&stepped, stride, index)?;
+            assert_eq!(
+                *address,
+                cpu::derive_address(&key, &backend.verifier),
+                "persist step address {index}"
+            );
+        }
+        let mut fresh = vec![[0; 20]; count];
+        backend.derive_batch(&stepped, &mut fresh)?;
+        assert_eq!(second, fresh, "persist step must match a fresh scalar mul");
+        Ok(())
+    }
+
     #[test]
     fn metal_config_rejects_invalid_window_inflight_and_chunk() {
         let mut affine = MetalConfig::default();
@@ -1046,6 +1219,7 @@ mod tests {
         let mut invalid = MetalConfig {
             window_bits: 5,
             affine: false,
+            split_keccak: false,
             ..MetalConfig::default()
         };
         assert!(invalid.validate().is_err());
@@ -1111,7 +1285,8 @@ mod tests {
             while keys.len() < backend.capacity {
                 keys.push(crate::search::generate_secret_key(&mut rng));
             }
-            // Consecutive scalars from 64: every prefix slices into accepted chains.
+            // Consecutive scalars from 128: every prefix slices into accepted
+            // chains, including persist's k >= stride+1 rule.
             let seq_keys = super::super::sequential_test_keys(backend.capacity)?;
             let stride = backend.increment_stride();
             let address_keys = if stride > 1 { &seq_keys } else { &keys };
@@ -1125,6 +1300,9 @@ mod tests {
                         &keys[..66]
                     };
                     inflight_overlap_differential(&mut dual, overlap)?;
+                    if dual.persist_increment() {
+                        persist_step_differential(&mut dual, overlap)?;
+                    }
                 }
             }
             let counts: &[usize] =
@@ -1244,6 +1422,18 @@ mod tests {
                 MetalConfig {
                     chunk: 32,
                     affine: false,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    split_keccak: true,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    persist: false,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    simd: false,
                     ..MetalConfig::default()
                 },
             ];

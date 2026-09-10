@@ -82,9 +82,31 @@ pub(crate) fn chain_start_accepted(start: &SecretKey, len: usize) -> bool {
     !small && offset_secret_key(start, len - 1).is_some()
 }
 
+/// Batches of headroom kept when GPU chain points persist across search steps.
+/// 2^20 batches of stride 32 is ~3.4e7 scalars per chain, far beyond a session,
+/// while still fitting `offset_secret_key`'s `usize` addend.
+pub(crate) const PERSIST_HEADROOM_BATCHES: usize = 1 << 20;
+
+/// Advance every start by `stride`. False if any chain would leave the scalar
+/// range or hit the persist `+stride·G` exceptions (`k = stride` / `k+stride = n`).
+pub(crate) fn advance_chain_starts(keys: &mut [SecretKey], stride: usize) -> bool {
+    let stride = stride.max(1);
+    for key in keys {
+        let Some(next) = offset_secret_key(key, stride) else {
+            return false;
+        };
+        if !chain_start_accepted(&next, stride + 1) {
+            return false;
+        }
+        key.non_secure_erase();
+        *key = next;
+    }
+    true
+}
+
 /// Startup vectors: `1`, `n-1`, and one full chain. Returns the complete
-/// scalar list per batch; the chain start is `max(stride, 2)` so it passes
-/// `chain_start_accepted` for every kernel formula.
+/// scalar list per batch; the chain start is `max(stride, 2)+1` so it passes
+/// `chain_start_accepted` for every kernel formula, including persist `+S·G`.
 fn gpu_self_test_batches(stride: usize, capacity: usize) -> Result<Vec<Vec<SecretKey>>> {
     let mut one = [0; 32];
     one[31] = 1;
@@ -92,7 +114,8 @@ fn gpu_self_test_batches(stride: usize, capacity: usize) -> Result<Vec<Vec<Secre
     last[31] -= 1;
     let chain_len = stride.max(3).min(capacity);
     let mut first = [0; 32];
-    first[31] = stride.max(2) as u8;
+    // Persist stores (k+S)·G, so the start must be at least S+1, not S.
+    first[31] = stride.max(2) as u8 + 1;
     let mut chain = Vec::with_capacity(chain_len);
     let mut key = SecretKey::from_byte_array(first)?;
     chain.push(key);
@@ -169,12 +192,13 @@ pub(crate) fn run_self_test<B: AddressBackend>(
     Ok(())
 }
 
-/// Consecutive scalars from 64 upwards: accepted as chain starts for every
-/// supported stride (≤ 64), so tests can slice any prefix into chains.
+/// Consecutive scalars from 128 upwards: accepted as chain starts for every
+/// supported stride (≤ 64), including persist which needs `k >= stride + 1`,
+/// so tests can slice any prefix into chains.
 #[cfg(test)]
 pub(crate) fn sequential_test_keys(count: usize) -> Result<Vec<SecretKey>> {
     let mut bytes = [0; 32];
-    bytes[31] = 64;
+    bytes[31] = 128;
     let mut key = SecretKey::from_byte_array(bytes)?;
     let mut keys = Vec::with_capacity(count);
     for index in 0..count {
@@ -215,6 +239,20 @@ pub(crate) trait AddressBackend {
     fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
         let _ = (keys, count);
         bail!("begin_batch is GPU-only")
+    }
+
+    /// `resume` means this GPU slot already holds the chain points for `keys`
+    /// and should step by `increment_stride()` instead of a scalar mul.
+    /// CUDA/Vulkan ignore it and always derive from `keys`.
+    fn begin_resumed(&mut self, keys: &[SecretKey], count: usize, resume: bool) -> Result<()> {
+        let _ = resume;
+        self.begin_batch(keys, count)
+    }
+
+    /// Host may advance the same chain starts across batches (Metal keeps
+    /// affine points). CPU/CUDA/Vulkan stay one-shot CSPRNG starts.
+    fn persist_increment(&self) -> bool {
+        false
     }
 
     fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
@@ -285,6 +323,21 @@ impl AddressBackend for GpuBackend {
             Self::Metal(backend) => backend.begin_batch(keys, count),
             Self::Cuda(backend) => backend.begin_batch(keys, count),
             Self::Vulkan(backend) => backend.begin_batch(keys, count),
+        }
+    }
+
+    fn begin_resumed(&mut self, keys: &[SecretKey], count: usize, resume: bool) -> Result<()> {
+        match self {
+            Self::Metal(backend) => backend.begin_resumed(keys, count, resume),
+            Self::Cuda(backend) => backend.begin_batch(keys, count),
+            Self::Vulkan(backend) => backend.begin_batch(keys, count),
+        }
+    }
+
+    fn persist_increment(&self) -> bool {
+        match self {
+            Self::Metal(backend) => backend.persist_increment(),
+            Self::Cuda(_) | Self::Vulkan(_) => false,
         }
     }
 
@@ -477,6 +530,13 @@ mod tests {
             &SecretKey::from_byte_array(too_short).unwrap(),
             32
         ));
+        let mut keys = sequential_test_keys(2).unwrap();
+        assert!(advance_chain_starts(&mut keys, 32));
+        assert_eq!(keys[0], sequential_test_keys(34).unwrap()[32]);
+        let mut near = secp256k1::constants::CURVE_ORDER;
+        near[31] -= 5;
+        let mut dying = [SecretKey::from_byte_array(near).unwrap()];
+        assert!(!advance_chain_starts(&mut dying, 32));
     }
 
     #[test]

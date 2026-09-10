@@ -8,6 +8,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(10);
 struct PreparedBatch {
     sequence: u64,
     keys: KeyBatch,
+    resume: bool,
 }
 
 fn receive<T>(receiver: &channel::Receiver<T>, stop: &AtomicBool) -> Result<Option<T>> {
@@ -76,6 +77,10 @@ impl<O: Observer> KeySource for PipelineSource<O> {
         Ok(Some(&batch.keys.0))
     }
 
+    fn resume(&self) -> bool {
+        self.current.as_ref().is_some_and(|batch| batch.resume)
+    }
+
     fn recycle(&mut self, stop: &AtomicBool) -> Result<()> {
         if let Some(batch) = self.current.take() {
             let waiting = self.observer.start();
@@ -86,18 +91,21 @@ impl<O: Observer> KeySource for PipelineSource<O> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn produce<R: RngCore + CryptoRng, O: Observer>(
     recycle: channel::Receiver<PreparedBatch>,
     ready: channel::Sender<PreparedBatch>,
     stop: &AtomicBool,
     batch_size: usize,
     stride: usize,
+    persist: bool,
     observer: O,
     seed: impl FnOnce() -> Result<R>,
 ) -> Result<()> {
     let _stop_on_exit = StopOnExit(stop);
     let mut rng = seed()?;
     let mut sequence = 0u64;
+    let chains = chain_count(batch_size, stride);
     loop {
         let waiting = observer.start();
         let next = receive(&recycle, stop)?;
@@ -106,9 +114,35 @@ fn produce<R: RngCore + CryptoRng, O: Observer>(
             break;
         };
         let preparing = observer.start();
-        if !fill_secret_keys(&mut rng, &mut batch.keys.0, batch_size, stride, Some(stop)) {
-            observer.finish(Stage::Prepare, preparing);
-            return Ok(());
+        if persist && stride > 1 && batch.keys.0.len() == chains {
+            if crate::backend::advance_chain_starts(&mut batch.keys.0, stride) {
+                batch.resume = true;
+            } else if !fill_secret_keys(
+                &mut rng,
+                &mut batch.keys.0,
+                batch_size,
+                stride,
+                Some(stop),
+                true,
+            ) {
+                observer.finish(Stage::Prepare, preparing);
+                return Ok(());
+            } else {
+                batch.resume = false;
+            }
+        } else {
+            if !fill_secret_keys(
+                &mut rng,
+                &mut batch.keys.0,
+                batch_size,
+                stride,
+                Some(stop),
+                persist && stride > 1,
+            ) {
+                observer.finish(Stage::Prepare, preparing);
+                return Ok(());
+            }
+            batch.resume = false;
         }
         observer.finish(Stage::Prepare, preparing);
         batch.sequence = sequence;
@@ -144,12 +178,14 @@ where
         "invalid pipeline batch size"
     );
     let stride = backend.increment_stride().max(1);
+    let persist = backend.persist_increment();
     let (ready_tx, ready_rx) = channel::bounded(1);
     let (recycle_tx, recycle_rx) = channel::bounded(2);
     for _ in 0..2 {
         recycle_tx.send(PreparedBatch {
             sequence: 0,
             keys: KeyBatch(Vec::with_capacity(chain_count(batch_size, stride))),
+            resume: false,
         })?;
     }
     std::thread::scope(|scope| {
@@ -163,6 +199,7 @@ where
                 stop,
                 batch_size,
                 stride,
+                persist,
                 producer_observer,
                 seed,
             )
@@ -238,12 +275,13 @@ mod tests {
             recycle_tx.send(PreparedBatch {
                 sequence: 0,
                 keys: KeyBatch(Vec::with_capacity(33)),
+                resume: false,
             })?;
         }
         std::thread::scope(|scope| -> Result<()> {
             let guard = StopOnExit(&stop);
             let producer = scope.spawn(|| {
-                produce(recycle_rx, ready_tx, &stop, 33, 1, Noop, || {
+                produce(recycle_rx, ready_tx, &stop, 33, 1, false, Noop, || {
                     Ok(ChaCha20Rng::from_seed([19; 32]))
                 })
             });
@@ -499,9 +537,10 @@ mod tests {
             .send(PreparedBatch {
                 sequence: 0,
                 keys: KeyBatch(Vec::with_capacity(2048)),
+                resume: false,
             })
             .unwrap();
-        produce(recycle_rx, ready_tx, &stop, 2048, 1, Noop, || {
+        produce(recycle_rx, ready_tx, &stop, 2048, 1, false, Noop, || {
             Ok(CancellingRng {
                 generated: &generated,
                 stop: &stop,
@@ -521,6 +560,7 @@ mod tests {
             .send(PreparedBatch {
                 sequence: 1,
                 keys: KeyBatch(vec![]),
+                resume: false,
             })
             .unwrap();
         let mut source = PipelineSource {
