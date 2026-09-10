@@ -16,6 +16,9 @@ using namespace metal;
 #ifndef INCREMENT_STRIDE
 #define INCREMENT_STRIDE 1
 #endif
+#ifndef OPT_AFFINE
+#define OPT_AFFINE 0
+#endif
 
 // Little-endian 32-bit limbs, canonical modulo p = 2^256 - 2^32 - 977.
 // All scalar-dependent choices below use masks, not branches or table indices.
@@ -621,10 +624,11 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
                                    constant uint &count [[buffer(3)]],
                                    uint gid [[thread_position_in_grid]]) {
 #if INCREMENT_STRIDE > 1
+    // keys holds one chain start per thread (compact), not one scalar per address.
     uint base = gid * INCREMENT_STRIDE;
     if (base >= count) return;
     uint chain = min(uint(INCREMENT_STRIDE), count - base);
-    Point p = public_jacobian(keys + base * 32, table);
+    Point p = public_jacobian(keys + gid * 32, table);
     // CHUNK_SIZE == INCREMENT_STRIDE inverts the whole chain once; smaller
     // chunks repeat invert to cut thread-private Point arrays.
     for (uint offset = 0; offset < chain; offset += CHUNK_SIZE) {
@@ -648,5 +652,74 @@ kernel void chunk_derive_addresses(device const uchar *keys [[buffer(0)]],
     }
     montgomery_chunk_affine_keccak(pts, base, count, addresses);
 #endif
+}
+#endif
+
+#if INCREMENT_STRIDE > 1 && OPT_AFFINE
+// Affine batched addition (the VanitySearch/profanity layout). One thread owns
+// a chain k, k+1, ..., k+S-1. Only P0 = k*G needs the windowed scalar
+// multiplication; every other point is P0 + i*G with i*G read from table row 0
+// (window 0, digit i, valid while radix > S). Because all i*G are affine
+// constants, the S-1 denominators dx_i = gx_i - x0 depend only on P0, so one
+// Montgomery trick inverts them together with Z0. Per address this costs ~11
+// field multiplications plus fe_inverse/S, versus a Jacobian mixed add (11)
+// plus chunked inversion and affine conversion (~40) on the P += G path.
+//
+// Work stays in Jacobian terms until the inverse arrives. With zz = Z^2 and
+// zzz = Z^3: dx_i = (gx_i*zz - X)/zz = d_i/zz, dy_i = (gy_i*zzz - Y)/zzz =
+// e_i/zzz, hence lambda_i = e_i / (Z*d_i) = e_i * inv(d_i) * inv(Z).
+// Exceptions (P0 = ±i*G, i.e. k = i or k + i = n) are excluded by the host
+// rule chain_start_accepted: k >= chain length and k + chain - 1 <= n - 1.
+// Chain scalars are host-validated, so d_i is never zero here.
+kernel void chain_affine_addresses(device const uchar *keys [[buffer(0)]],
+                                   device const uint *table [[buffer(1)]],
+                                   device uchar *addresses [[buffer(2)]],
+                                   constant uint &count [[buffer(3)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    uint base = gid * INCREMENT_STRIDE;
+    if (base >= count) return; // public batch boundary
+    uint chain = min(uint(INCREMENT_STRIDE), count - base);
+    Point p = public_jacobian(keys + gid * 32, table);
+    Fe zz = fe_square(p.z);
+    Fe zzz = fe_mul(p.z, zz);
+
+    // prefix[i] = d_1 * ... * d_i (prefix[0] = 1); padding lanes contribute 1.
+    Fe prefix[INCREMENT_STRIDE];
+    Fe acc = fe_one();
+    prefix[0] = acc;
+    for (uint i = 1; i < INCREMENT_STRIDE; ++i) {
+        if (i < chain) {
+            Fe gx = load_fe(table + i * 16);
+            acc = fe_mul(acc, fe_sub(fe_mul(gx, zz), p.x));
+        }
+        prefix[i] = acc;
+    }
+    // One inversion for Z and every d_i: inv(Z * prod d) -> inv(Z), inv(prod d).
+    Fe inv = fe_inverse(fe_mul(acc, p.z));
+    Fe zinv = fe_mul(inv, acc);
+    inv = fe_mul(inv, p.z);
+
+    Fe zzinv = fe_square(zinv);
+    Point p0 = {fe_mul(p.x, zzinv), fe_mul(p.y, fe_mul(zzinv, zinv)), fe_one()};
+    eth_address(p0, addresses + base * 20);
+
+    // Walk back: before step i, inv = inv(prefix[i]); prefix[i-1] * inv isolates
+    // inv(d_i), then multiplying by d_i moves inv to prefix[i-1].
+    for (uint i = INCREMENT_STRIDE; i-- > 1; ) {
+        if (i < chain) {
+            Fe gx = load_fe(table + i * 16);
+            Fe gy = load_fe(table + i * 16 + 8);
+            Fe d = fe_sub(fe_mul(gx, zz), p.x);
+            Fe e = fe_sub(fe_mul(gy, zzz), p.y);
+            Fe dinv = fe_mul(inv, prefix[i - 1]);
+            inv = fe_mul(inv, d);
+            Fe lambda = fe_mul(fe_mul(e, dinv), zinv);
+            Point q;
+            q.x = fe_sub(fe_sub(fe_square(lambda), p0.x), gx);
+            q.y = fe_sub(fe_mul(lambda, fe_sub(p0.x, q.x)), p0.y);
+            q.z = fe_one();
+            eth_address(q, addresses + (base + i) * 20);
+        }
+    }
 }
 #endif

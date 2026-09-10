@@ -1,4 +1,4 @@
-use crate::backend::{Address, AddressBackend, cpu};
+use crate::backend::{Address, AddressBackend, chain_count, chain_key, cpu};
 use crate::timing::{Noop, Observer, Stage};
 use anyhow::{Context, Result, ensure};
 use crossbeam::channel;
@@ -82,8 +82,9 @@ impl Drop for TryCounter<'_> {
     }
 }
 
-// SecretKey does not promise secure erasure. Wipe the storage of our batch on
-// every exit (including unwinding), after the backend has finished using it.
+// Chain starts only (one per `stride` addresses). SecretKey does not promise
+// secure erasure, so wipe the storage on every exit (including unwinding),
+// after the backend has finished using it.
 struct KeyBatch(Vec<SecretKey>);
 
 impl Drop for KeyBatch {
@@ -192,11 +193,12 @@ fn run_with_rng_observed<B: AddressBackend, O: Observer>(
         (1..=crate::backend::MAX_GPU_BATCH_SIZE as usize).contains(&batch_size),
         "invalid search batch size"
     );
+    let stride = backend.increment_stride().max(1);
     let mut source = SequentialSource {
         rng,
-        keys: KeyBatch(Vec::with_capacity(batch_size)),
+        keys: KeyBatch(Vec::with_capacity(chain_count(batch_size, stride))),
         size: batch_size,
-        stride: backend.increment_stride().max(1),
+        stride,
         observer: observer.clone(),
     };
     run_with_source(
@@ -236,6 +238,7 @@ fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
     if backend.inflight_capacity() > 1 {
         return run_inflight_source(backend, batch_size, context, progress, source, observer);
     }
+    let stride = backend.increment_stride().max(1);
     let mut addresses = vec![[0; 20]; batch_size];
     let mut counter = TryCounter {
         global: context.total,
@@ -270,23 +273,28 @@ fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
         // invalid proposed hit must not leave a partial snapshot from this batch.
         let matched = observer.start();
         let (best, hit) = evaluate_batch(&addresses, context.targets);
-        if let Some(index) = hit
-            && B::VERIFY_CANDIDATES
-        {
-            cpu::verify_address(&keys[index], &addresses[index], context.verifier)?;
-        }
+        let hit_key = hit
+            .map(|index| -> Result<_> {
+                let key = chain_key(keys, stride, index)?;
+                if B::VERIFY_CANDIDATES {
+                    cpu::verify_address(&key, &addresses[index], context.verifier)?;
+                }
+                Ok((index, key))
+            })
+            .transpose()?;
         if let Some(candidate) = best {
             let index = candidate.index;
+            let key = chain_key(keys, stride, index)?;
             let nibbles = address_nibbles(&addresses[index]);
             let improved = context.best.consider_checked(
                 &nibbles,
-                &keys[index],
+                &key,
                 base + index as u64 + 1,
                 candidate.prefix,
                 candidate.suffix,
                 || {
                     if B::VERIFY_CANDIDATES {
-                        cpu::verify_address(&keys[index], &addresses[index], context.verifier)?;
+                        cpu::verify_address(&key, &addresses[index], context.verifier)?;
                     }
                     Ok(())
                 },
@@ -308,13 +316,13 @@ fn run_with_source<B: AddressBackend, S: KeySource, O: Observer>(
             last_report_count = completed;
         }
 
-        if let Some(index) = hit {
+        if let Some((index, key)) = hit_key {
             if context.stop.swap(true, Ordering::SeqCst) {
                 break;
             }
             return Ok(Some(HitRecord {
                 address: nibbles_to_hex(&address_nibbles(&addresses[index])),
-                private_key: sk_to_hex(&keys[index]),
+                private_key: sk_to_hex(&key),
                 tries: base + index as u64 + 1,
                 elapsed_sec: start.elapsed().as_secs_f64(),
                 worker_id: context.worker_id,
@@ -337,6 +345,7 @@ fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
     observer: &O,
 ) -> Result<Option<HitRecord>> {
     let cap = backend.inflight_capacity();
+    let stride = backend.increment_stride().max(1);
     let mut addresses = vec![[0; 20]; batch_size];
     let mut held = VecDeque::with_capacity(cap);
     let mut counter = TryCounter {
@@ -353,7 +362,7 @@ fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
             let Some(keys) = source.next(context.stop)? else {
                 break;
             };
-            backend.begin_batch(keys)?;
+            backend.begin_batch(keys, batch_size)?;
             held.push_back(clone_key_batch(keys)?);
             source.recycle(context.stop)?;
         }
@@ -371,23 +380,28 @@ fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
         }
         let matched = observer.start();
         let (best, found) = evaluate_batch(&addresses, context.targets);
-        if let Some(index) = found
-            && B::VERIFY_CANDIDATES
-        {
-            cpu::verify_address(&keys.0[index], &addresses[index], context.verifier)?;
-        }
+        let found = found
+            .map(|index| -> Result<_> {
+                let key = chain_key(&keys.0, stride, index)?;
+                if B::VERIFY_CANDIDATES {
+                    cpu::verify_address(&key, &addresses[index], context.verifier)?;
+                }
+                Ok((index, key))
+            })
+            .transpose()?;
         if let Some(candidate) = best {
             let index = candidate.index;
+            let key = chain_key(&keys.0, stride, index)?;
             let nibbles = address_nibbles(&addresses[index]);
             let improved = context.best.consider_checked(
                 &nibbles,
-                &keys.0[index],
+                &key,
                 base + index as u64 + 1,
                 candidate.prefix,
                 candidate.suffix,
                 || {
                     if B::VERIFY_CANDIDATES {
-                        cpu::verify_address(&keys.0[index], &addresses[index], context.verifier)?;
+                        cpu::verify_address(&key, &addresses[index], context.verifier)?;
                     }
                     Ok(())
                 },
@@ -408,11 +422,11 @@ fn run_inflight_source<B: AddressBackend, S: KeySource, O: Observer>(
             last_report = Instant::now();
             last_report_count = completed;
         }
-        if let Some(index) = found {
+        if let Some((index, key)) = found {
             context.stop.store(true, Ordering::SeqCst);
             hit = Some(HitRecord {
                 address: nibbles_to_hex(&address_nibbles(&addresses[index])),
-                private_key: sk_to_hex(&keys.0[index]),
+                private_key: sk_to_hex(&key),
                 tries: base + index as u64 + 1,
                 elapsed_sec: start.elapsed().as_secs_f64(),
                 worker_id: context.worker_id,
@@ -450,6 +464,45 @@ impl BatchCandidate {
     }
 }
 
+/// Nibble `position` (0 = most significant) read straight from the bytes.
+#[inline(always)]
+fn nibble_at(address: &Address, position: usize) -> u8 {
+    let byte = address[position / 2];
+    if position % 2 == 0 {
+        byte >> 4
+    } else {
+        byte & 15
+    }
+}
+
+/// Same result as `prefix_match_len(&address_nibbles(address), pattern)` but
+/// stops at the first mismatch without expanding all 40 nibbles: nearly every
+/// address in a batch fails on its first nibble, so this is the hot loop of
+/// GPU batch matching.
+#[inline]
+fn prefix_match_len_bytes(address: &Address, pattern: &[u8]) -> usize {
+    let mut matched = 0;
+    for &expected in pattern.iter().take(40) {
+        if nibble_at(address, matched) != expected {
+            break;
+        }
+        matched += 1;
+    }
+    matched
+}
+
+#[inline]
+fn suffix_match_len_bytes(address: &Address, pattern: &[u8]) -> usize {
+    let mut matched = 0;
+    for &expected in pattern.iter().rev().take(40) {
+        if nibble_at(address, 39 - matched) != expected {
+            break;
+        }
+        matched += 1;
+    }
+    matched
+}
+
 fn evaluate_batch(
     addresses: &[Address],
     targets: &Targets,
@@ -457,11 +510,10 @@ fn evaluate_batch(
     let mut best: Option<BatchCandidate> = None;
     let mut hit = None;
     for (index, address) in addresses.iter().enumerate() {
-        let nibbles = address_nibbles(address);
         let candidate = BatchCandidate {
             index,
-            prefix: prefix_match_len(&nibbles, &targets.prefix),
-            suffix: suffix_match_len(&nibbles, &targets.suffix),
+            prefix: prefix_match_len_bytes(address, &targets.prefix),
+            suffix: suffix_match_len_bytes(address, &targets.suffix),
         };
         if candidate.prefix + candidate.suffix > 0
             && best.is_none_or(|current| candidate.rank() > current.rank())
@@ -573,6 +625,9 @@ impl BestState {
     }
 }
 
+/// Reference nibble-array matchers; production matching works on address bytes
+/// (`prefix_match_len_bytes`), and tests check both agree.
+#[cfg(test)]
 pub(crate) fn prefix_match_len(nibbles: &[u8; 40], pattern: &[u8]) -> usize {
     pattern
         .iter()
@@ -581,6 +636,7 @@ pub(crate) fn prefix_match_len(nibbles: &[u8; 40], pattern: &[u8]) -> usize {
         .count()
 }
 
+#[cfg(test)]
 pub(crate) fn suffix_match_len(nibbles: &[u8; 40], pattern: &[u8]) -> usize {
     pattern
         .iter()
@@ -602,9 +658,13 @@ pub(crate) fn generate_secret_key(rng: &mut (impl RngCore + CryptoRng)) -> Secre
     }
 }
 
-/// Fill `size` keys. `stride > 1` emits CSPRNG chain starts, then k+1..k+stride-1.
-/// Each chain still has 256-bit starting entropy; offsets are not independent draws.
-/// Returns false if `stop` is set mid-batch; already-written keys stay in `keys`.
+/// Fill the chain starts for `size` addresses: `chain_count(size, stride)`
+/// CSPRNG scalars, each accepted by `chain_start_accepted` for its chain
+/// length. The backend derives `k+1..k+stride-1` itself; the host recomputes
+/// them only for hits and candidates. Each chain has 256-bit starting entropy;
+/// offsets within a chain are not independent draws.
+/// Returns false if `stop` is set mid-batch (checked every 1024 addresses);
+/// already-written keys stay in `keys`.
 pub(crate) fn fill_secret_keys(
     rng: &mut (impl RngCore + CryptoRng),
     keys: &mut Vec<SecretKey>,
@@ -612,69 +672,29 @@ pub(crate) fn fill_secret_keys(
     stride: usize,
     stop: Option<&AtomicBool>,
 ) -> bool {
-    keys.truncate(size);
-    if stride <= 1 {
-        for (index, key) in keys.iter_mut().enumerate() {
-            if index > 0
-                && index % 1024 == 0
-                && stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                return false;
-            }
-            key.non_secure_erase();
-            *key = generate_secret_key(rng);
-        }
-        while keys.len() < size {
-            if keys.len() % 1024 == 0
-                && !keys.is_empty()
-                && stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                return false;
-            }
-            keys.push(generate_secret_key(rng));
-        }
-        return true;
-    }
-    let mut index = 0;
-    while index < size {
-        if index > 0 && index % 1024 == 0 && stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+    let stride = stride.max(1);
+    let chains = chain_count(size, stride);
+    keys.truncate(chains);
+    for chain in 0..chains {
+        let first = chain * stride;
+        if chain > 0
+            && first % 1024 < stride
+            && stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
             return false;
         }
-        let chain = (size - index).min(stride);
-        loop {
-            let mut current = generate_secret_key(rng);
-            if chain > 1 && crate::backend::is_generator_scalar(&current) {
-                continue;
+        let len = (size - first).min(stride);
+        let start = loop {
+            let candidate = generate_secret_key(rng);
+            if crate::backend::chain_start_accepted(&candidate, len) {
+                break candidate;
             }
-            let mut next_index = index;
-            let mut ok = true;
-            for step in 0..chain {
-                if step > 0 {
-                    match crate::backend::increment_secret_key(&current) {
-                        Some(next) => current = next,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if next_index < keys.len() {
-                    keys[next_index].non_secure_erase();
-                    keys[next_index] = current;
-                } else {
-                    keys.push(current);
-                }
-                next_index += 1;
-            }
-            if ok {
-                index = next_index;
-                break;
-            }
-            while keys.len() > index {
-                if let Some(mut key) = keys.pop() {
-                    key.non_secure_erase();
-                }
-            }
+        };
+        if let Some(slot) = keys.get_mut(chain) {
+            slot.non_secure_erase();
+            *slot = start;
+        } else {
+            keys.push(start);
         }
     }
     true
@@ -885,23 +905,24 @@ mod tests {
     }
 
     #[test]
-    fn fill_secret_keys_emits_increment_chains() {
+    fn fill_secret_keys_emits_one_accepted_start_per_chain() {
         let mut rng = ChaCha20Rng::from_seed([23; 32]);
         let mut keys = Vec::new();
         assert!(fill_secret_keys(&mut rng, &mut keys, 40, 32, None));
-        assert_eq!(keys.len(), 40);
-        for start in (0..32).step_by(32) {
-            let mut current = keys[start];
-            for key in &keys[start + 1..32] {
-                current = crate::backend::increment_secret_key(&current).unwrap();
-                assert_eq!(*key, current);
-            }
-        }
+        assert_eq!(keys.len(), 2);
+        assert!(crate::backend::chain_start_accepted(&keys[0], 32));
+        assert!(crate::backend::chain_start_accepted(&keys[1], 8));
+        // Starts come straight from the CSPRNG stream; address 33 is start 1 + 1.
+        let mut expected = ChaCha20Rng::from_seed([23; 32]);
+        assert_eq!(keys[0], generate_secret_key(&mut expected));
+        assert_eq!(keys[1], generate_secret_key(&mut expected));
         assert_eq!(
-            keys[33],
-            crate::backend::increment_secret_key(&keys[32]).unwrap()
+            chain_key(&keys, 32, 33).unwrap(),
+            crate::backend::increment_secret_key(&keys[1]).unwrap()
         );
-        assert!(!crate::backend::is_generator_scalar(&keys[0]));
+        // Refilling a shorter batch reuses and truncates the storage.
+        assert!(fill_secret_keys(&mut rng, &mut keys, 32, 32, None));
+        assert_eq!(keys.len(), 1);
         let mut independent = Vec::new();
         let mut expected = ChaCha20Rng::from_seed([23; 32]);
         assert!(fill_secret_keys(
@@ -911,8 +932,94 @@ mod tests {
             1,
             None
         ));
+        assert_eq!(independent.len(), 3);
         assert_eq!(independent[0], generate_secret_key(&mut expected));
         assert_eq!(independent[1], generate_secret_key(&mut expected));
+    }
+
+    #[test]
+    fn fill_secret_keys_rejects_starts_that_would_hit_chain_exceptions() {
+        // An RNG that first offers 1 (P = G, doubling on +G) and n-1 (wraps),
+        // then a scalar that fits: the two exceptions must be skipped.
+        struct Scripted(Vec<[u8; 32]>);
+        impl CryptoRng for Scripted {}
+        impl RngCore for Scripted {
+            fn next_u32(&mut self) -> u32 {
+                unreachable!()
+            }
+            fn next_u64(&mut self) -> u64 {
+                unreachable!()
+            }
+            fn fill_bytes(&mut self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.0.remove(0));
+            }
+            fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> std::result::Result<(), rand::Error> {
+                self.fill_bytes(bytes);
+                Ok(())
+            }
+        }
+        let mut one = [0; 32];
+        one[31] = 1;
+        let mut last = secp256k1::constants::CURVE_ORDER;
+        last[31] -= 1;
+        let mut fits = [0; 32];
+        fits[31] = 32;
+        let mut keys = Vec::new();
+        assert!(fill_secret_keys(
+            &mut Scripted(vec![one, last, fits]),
+            &mut keys,
+            32,
+            32,
+            None
+        ));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].secret_bytes(), fits);
+        // A single-address chain accepts 1 directly.
+        let mut single = Vec::new();
+        assert!(fill_secret_keys(
+            &mut Scripted(vec![one]),
+            &mut single,
+            1,
+            32,
+            None
+        ));
+        assert_eq!(single[0].secret_bytes(), one);
+    }
+
+    #[test]
+    fn byte_matching_agrees_with_nibble_matching() {
+        let mut rng = ChaCha20Rng::from_seed([29; 32]);
+        for _ in 0..2000 {
+            let mut address = [0u8; 20];
+            rng.fill_bytes(&mut address);
+            let nibbles = address_nibbles(&address);
+            let prefix_len = (rng.next_u32() % 41) as usize;
+            let suffix_len = (rng.next_u32() % 41) as usize;
+            let mut prefix = nibbles[..prefix_len].to_vec();
+            let mut suffix = nibbles[40 - suffix_len..].to_vec();
+            // Corrupt a random position sometimes so partial matches happen.
+            if prefix_len > 0 && rng.next_u32() % 2 == 0 {
+                let at = (rng.next_u32() as usize) % prefix_len;
+                prefix[at] ^= 1;
+            }
+            if suffix_len > 0 && rng.next_u32() % 2 == 0 {
+                let at = (rng.next_u32() as usize) % suffix_len;
+                suffix[at] ^= 1;
+            }
+            assert_eq!(
+                prefix_match_len_bytes(&address, &prefix),
+                prefix_match_len(&nibbles, &prefix)
+            );
+            assert_eq!(
+                suffix_match_len_bytes(&address, &suffix),
+                suffix_match_len(&nibbles, &suffix)
+            );
+        }
+        let address = [0x12; 20];
+        assert_eq!(prefix_match_len_bytes(&address, &[]), 0);
+        assert_eq!(suffix_match_len_bytes(&address, &[]), 0);
+        assert_eq!(prefix_match_len_bytes(&address, &[1, 2, 1, 3]), 3);
+        assert_eq!(suffix_match_len_bytes(&address, &[3, 1, 2]), 2);
     }
 
     #[test]

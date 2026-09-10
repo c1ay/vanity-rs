@@ -1,6 +1,6 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use clap::ValueEnum;
-use secp256k1::SecretKey;
+use secp256k1::{All, Secp256k1, SecretKey};
 
 pub(crate) mod cpu;
 pub(crate) mod cuda;
@@ -20,32 +20,81 @@ pub(crate) const DEFAULT_INCREMENT_STRIDE: u32 = 32;
 
 /// Next curve scalar, or `None` if adding 1 leaves the secp256k1 range.
 pub(crate) fn increment_secret_key(key: &SecretKey) -> Option<SecretKey> {
-    let mut bytes = key.secret_bytes();
+    offset_secret_key(key, 1)
+}
+
+/// `start + offset` as a curve scalar, or `None` if it leaves the range.
+/// Big-endian byte addition; `offset` is at most a chain stride (< 2^32).
+pub(crate) fn offset_secret_key(start: &SecretKey, offset: usize) -> Option<SecretKey> {
+    let mut bytes = start.secret_bytes();
+    let mut carry = offset as u64;
     for byte in bytes.iter_mut().rev() {
-        let (next, overflow) = byte.overflowing_add(1);
-        *byte = next;
-        if !overflow {
-            return SecretKey::from_byte_array(bytes).ok();
+        if carry == 0 {
+            break;
         }
+        let sum = u64::from(*byte) + (carry & 0xff);
+        *byte = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
     }
-    None
+    if carry != 0 {
+        return None;
+    }
+    SecretKey::from_byte_array(bytes).ok()
 }
 
-pub(crate) fn is_generator_scalar(key: &SecretKey) -> bool {
-    let bytes = key.secret_bytes();
-    bytes[..31].iter().all(|&byte| byte == 0) && bytes[31] == 1
+/// Chain starts needed for `count` addresses when every chain covers `stride`
+/// consecutive scalars (the last chain may be shorter).
+pub(crate) fn chain_count(count: usize, stride: usize) -> usize {
+    count.div_ceil(stride.max(1))
 }
 
+/// Scalar of address `index`: chain `index / stride` start plus `index % stride`.
+pub(crate) fn chain_key(starts: &[SecretKey], stride: usize, index: usize) -> Result<SecretKey> {
+    let stride = stride.max(1);
+    let start = starts
+        .get(index / stride)
+        .ok_or_else(|| anyhow::anyhow!("address index outside the key batch"))?;
+    offset_secret_key(start, index % stride)
+        .ok_or_else(|| anyhow::anyhow!("chain leaves scalar range"))
+}
+
+/// `keys` must hold exactly one start per chain for `count` addresses.
+pub(crate) fn check_chain_batch(keys: &[SecretKey], count: usize, stride: usize) -> Result<()> {
+    ensure!(
+        keys.len() == chain_count(count, stride),
+        "batch key count does not match address count"
+    );
+    Ok(())
+}
+
+/// Host-side rule for a chain `k, k+1, …, k+len-1`. Kernels add `i·G` (or `G`
+/// repeatedly) with incomplete affine/mixed formulas, whose exceptions are
+/// `P = ±Q`: doubling when `k = i` for some `0 < i < len`, infinity when
+/// `k + i = n`. Requiring `k >= len` and `k + len - 1 <= n - 1` excludes both.
+/// Chains of length one add nothing and accept any valid scalar.
+pub(crate) fn chain_start_accepted(start: &SecretKey, len: usize) -> bool {
+    if len <= 1 {
+        return true;
+    }
+    let bytes = start.secret_bytes();
+    let small = bytes[..24].iter().all(|&byte| byte == 0)
+        && u64::from_be_bytes(bytes[24..].try_into().unwrap()) < len as u64;
+    !small && offset_secret_key(start, len - 1).is_some()
+}
+
+/// Startup vectors: `1`, `n-1`, and one full chain. Returns the complete
+/// scalar list per batch; the chain start is `max(stride, 2)` so it passes
+/// `chain_start_accepted` for every kernel formula.
 fn gpu_self_test_batches(stride: usize, capacity: usize) -> Result<Vec<Vec<SecretKey>>> {
     let mut one = [0; 32];
     one[31] = 1;
-    let mut two = [0; 32];
-    two[31] = 2;
     let mut last = secp256k1::constants::CURVE_ORDER;
     last[31] -= 1;
     let chain_len = stride.max(3).min(capacity);
+    let mut first = [0; 32];
+    first[31] = stride.max(2) as u8;
     let mut chain = Vec::with_capacity(chain_len);
-    let mut key = SecretKey::from_byte_array(two)?;
+    let mut key = SecretKey::from_byte_array(first)?;
     chain.push(key);
     for _ in 1..chain_len {
         key = increment_secret_key(&key)
@@ -59,10 +108,73 @@ fn gpu_self_test_batches(stride: usize, capacity: usize) -> Result<Vec<Vec<Secre
     ])
 }
 
+/// Every start of consecutive `stride`-long chains in a full scalar list.
+pub(crate) fn chain_starts(keys: &[SecretKey], stride: usize) -> Vec<SecretKey> {
+    keys.iter().copied().step_by(stride.max(1)).collect()
+}
+
+/// Writes one big-endian 32-byte scalar per address (`count * 32` bytes) from
+/// chain starts, for kernels that still read a full per-address key layout.
+/// Plain byte increments: starts were accepted by the host, so no scalar can
+/// leave the range; a 256-bit wrap is still reported.
+pub(crate) fn expand_chain_keys(
+    starts: &[SecretKey],
+    stride: usize,
+    count: usize,
+    destination: &mut [u8],
+) -> Result<()> {
+    let stride = stride.max(1);
+    check_chain_batch(starts, count, stride)?;
+    ensure!(
+        destination.len() >= count * 32,
+        "expanded key buffer too small"
+    );
+    for (chain, start) in starts.iter().enumerate() {
+        let first = chain * stride;
+        let len = (count - first).min(stride);
+        let mut current = zeroize::Zeroizing::new(start.secret_bytes());
+        for offset in 0..len {
+            if offset > 0 {
+                let mut carried = true;
+                for byte in current.iter_mut().rev() {
+                    let (next, overflow) = byte.overflowing_add(1);
+                    *byte = next;
+                    if !overflow {
+                        carried = false;
+                        break;
+                    }
+                }
+                ensure!(!carried, "chain wrapped past 2^256");
+            }
+            destination[(first + offset) * 32..][..32].copy_from_slice(current.as_ref());
+        }
+    }
+    Ok(())
+}
+
+/// Runs the startup vectors through `backend` and checks every address on CPU.
+pub(crate) fn run_self_test<B: AddressBackend>(
+    backend: &mut B,
+    verifier: &Secp256k1<All>,
+    capacity: usize,
+) -> Result<()> {
+    let stride = backend.increment_stride().max(1);
+    for keys in gpu_self_test_batches(stride, capacity)? {
+        let mut addresses = vec![[0; 20]; keys.len()];
+        backend.derive_batch(&chain_starts(&keys, stride), &mut addresses)?;
+        for (key, address) in keys.iter().zip(&addresses) {
+            cpu::verify_address(key, address, verifier)?;
+        }
+    }
+    Ok(())
+}
+
+/// Consecutive scalars from 64 upwards: accepted as chain starts for every
+/// supported stride (≤ 64), so tests can slice any prefix into chains.
 #[cfg(test)]
 pub(crate) fn sequential_test_keys(count: usize) -> Result<Vec<SecretKey>> {
     let mut bytes = [0; 32];
-    bytes[31] = 2;
+    bytes[31] = 64;
     let mut key = SecretKey::from_byte_array(bytes)?;
     let mut keys = Vec::with_capacity(count);
     for index in 0..count {
@@ -77,6 +189,11 @@ pub(crate) fn sequential_test_keys(count: usize) -> Result<Vec<SecretKey>> {
 
 /// A batch is either fully derived or rejected. No output may be used on error.
 /// Implementations own their compute resources, never search state or file I/O.
+///
+/// `keys` are chain starts, not one scalar per address: address `j` belongs to
+/// `keys[j / stride] + j % stride` (see [`chain_key`]), and
+/// `keys.len() == chain_count(addresses.len(), stride)`. With stride 1 the two
+/// views coincide. Hosts only generate, hold, upload, and wipe the starts.
 pub(crate) trait AddressBackend {
     /// Only the CPU reference implementation opts out; new accelerators must
     /// keep independent CPU verification before publishing search candidates.
@@ -88,14 +205,15 @@ pub(crate) trait AddressBackend {
         1
     }
 
-    /// Host must emit this many consecutive scalars per GPU chain. `1` keeps
-    /// independent CSPRNG keys and one scalar multiplication per address.
+    /// Consecutive scalars per chain start. `1` keeps independent CSPRNG keys
+    /// and one scalar multiplication per address.
     fn increment_stride(&self) -> usize {
         1
     }
 
-    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
-        let _ = keys;
+    /// Submits `count` addresses from the chain starts in `keys` without waiting.
+    fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
+        let _ = (keys, count);
         bail!("begin_batch is GPU-only")
     }
 
@@ -162,11 +280,11 @@ impl AddressBackend for GpuBackend {
         }
     }
 
-    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
+    fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
         match self {
-            Self::Metal(backend) => backend.begin_batch(keys),
-            Self::Cuda(backend) => backend.begin_batch(keys),
-            Self::Vulkan(backend) => backend.begin_batch(keys),
+            Self::Metal(backend) => backend.begin_batch(keys, count),
+            Self::Cuda(backend) => backend.begin_batch(keys, count),
+            Self::Vulkan(backend) => backend.begin_batch(keys, count),
         }
     }
 
@@ -287,13 +405,104 @@ mod tests {
         let mut one = [0; 32];
         one[31] = 1;
         let start = SecretKey::from_byte_array(one).unwrap();
-        assert!(is_generator_scalar(&start));
         let two = increment_secret_key(&start).unwrap();
         assert_eq!(two.secret_bytes()[31], 2);
         let mut last = secp256k1::constants::CURVE_ORDER;
         last[31] -= 1;
         let last = SecretKey::from_byte_array(last).unwrap();
         assert!(increment_secret_key(&last).is_none());
+    }
+
+    #[test]
+    fn offset_secret_key_carries_across_limbs_and_stops_at_the_order() {
+        let mut bytes = [0; 32];
+        bytes[30] = 0x01;
+        bytes[31] = 0xff;
+        let start = SecretKey::from_byte_array(bytes).unwrap();
+        let moved = offset_secret_key(&start, 3).unwrap().secret_bytes();
+        assert_eq!((moved[30], moved[31]), (0x02, 0x02));
+        assert_eq!(offset_secret_key(&start, 0).unwrap(), start);
+        let mut near = secp256k1::constants::CURVE_ORDER;
+        near[31] -= 5;
+        let near = SecretKey::from_byte_array(near).unwrap();
+        assert!(offset_secret_key(&near, 4).is_some());
+        assert!(offset_secret_key(&near, 5).is_none());
+        let mut all_ff = [0xff; 32];
+        all_ff[0] = 0x7f;
+        let big = SecretKey::from_byte_array(all_ff).unwrap();
+        assert!(offset_secret_key(&big, 1).is_some());
+    }
+
+    #[test]
+    fn chain_helpers_index_and_validate_starts() {
+        let keys = sequential_test_keys(70).unwrap();
+        let starts = chain_starts(&keys, 32);
+        assert_eq!(starts.len(), 3);
+        assert_eq!(chain_count(70, 32), 3);
+        assert_eq!(chain_count(64, 32), 2);
+        assert_eq!(chain_count(0, 32), 0);
+        assert_eq!(chain_count(5, 1), 5);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(chain_key(&starts, 32, index).unwrap(), *key);
+        }
+        assert!(chain_key(&starts, 32, 96).is_err());
+        assert!(check_chain_batch(&starts, 70, 32).is_ok());
+        assert!(check_chain_batch(&starts, 64, 32).is_err());
+        assert!(check_chain_batch(&[], 0, 32).is_ok());
+
+        let scalar = |value: u8| {
+            let mut bytes = [0; 32];
+            bytes[31] = value;
+            SecretKey::from_byte_array(bytes).unwrap()
+        };
+        // Single-element chains never add, so 1 and n-1 stay acceptable.
+        assert!(chain_start_accepted(&scalar(1), 1));
+        assert!(!chain_start_accepted(&scalar(1), 2));
+        assert!(!chain_start_accepted(&scalar(31), 32));
+        assert!(chain_start_accepted(&scalar(32), 32));
+        let mut last = secp256k1::constants::CURVE_ORDER;
+        last[31] -= 1;
+        let last = SecretKey::from_byte_array(last).unwrap();
+        assert!(chain_start_accepted(&last, 1));
+        assert!(!chain_start_accepted(&last, 2));
+        let mut fits = secp256k1::constants::CURVE_ORDER;
+        fits[31] -= 32;
+        assert!(chain_start_accepted(
+            &SecretKey::from_byte_array(fits).unwrap(),
+            32
+        ));
+        let mut too_short = secp256k1::constants::CURVE_ORDER;
+        too_short[31] -= 31;
+        assert!(!chain_start_accepted(
+            &SecretKey::from_byte_array(too_short).unwrap(),
+            32
+        ));
+    }
+
+    #[test]
+    fn expand_chain_keys_matches_per_address_scalars() {
+        let keys = sequential_test_keys(70).unwrap();
+        let starts = chain_starts(&keys, 32);
+        let mut bytes = vec![0xaa; 70 * 32 + 7];
+        expand_chain_keys(&starts, 32, 70, &mut bytes).unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(&bytes[index * 32..][..32], &key.secret_bytes()[..]);
+        }
+        assert!(bytes[70 * 32..].iter().all(|&byte| byte == 0xaa));
+        assert!(expand_chain_keys(&starts, 32, 64, &mut bytes).is_err());
+        assert!(expand_chain_keys(&starts, 32, 70, &mut bytes[..100]).is_err());
+        let mut carry = [0xff; 32];
+        carry[0] = 0x7f;
+        carry[30] = 0xff;
+        carry[31] = 0xfe;
+        let start = SecretKey::from_byte_array(carry).unwrap();
+        let mut out = vec![0; 3 * 32];
+        expand_chain_keys(&[start], 3, 3, &mut out).unwrap();
+        assert_eq!(&out[64..][29..], &[0x00, 0x00, 0x00]);
+        assert_eq!(out[64 + 28], 0x00);
+        assert_eq!(out[64], 0x80);
+        let mut single = vec![0; 32];
+        expand_chain_keys(&[], 32, 0, &mut single).unwrap();
     }
 
     #[test]

@@ -61,6 +61,24 @@ GPU 时间来自命令完成后的 `GPUEndTime - GPUStartTime`。零值、非有
 
 `AddressBackend::derive_batch` 仍是 `begin_batch` + `end_batch`。每套槽有独立 input/output（仅拆核/threadgroup 求逆启用时另有 xyz），只读表共享。`begin` 上传并 commit，不等待；`end` 等待最旧命令、回读、抽样复核、清零该槽 input。Drop 等待所有在途命令。搜索在 `inflight_capacity() > 1` 时先 begin 再在槽满时 end+匹配；私钥副本活到 end。默认两个槽。停止收尾可能包含最多两批 GPU 时间。
 
-## 增量点加（默认 stride=32）
+## 增量点加（stride=32，`VANITY_BENCH_AFFINE=0` 对照路径）
 
-融合 kernel 对每条链只做一次 `public_jacobian`，随后 `INCREMENT_STRIDE-1` 次 `P += G`（G 取自窗口 0 digit 1，走不完整 `add_mixed`，不再做无穷点/零 digit 选择）。主机为每条链抽一个 CSPRNG 起点，再递增标量；链落在 `[2, n-1]`，避免 mixed-add 的倍点/无穷点例外。`VANITY_BENCH_STRIDE=1` 回到每地址一次标量乘。Dispatch 宽度为 `ceil(count / stride)`。CPU 后端仍逐钥 `from_secret_key`，不走增量。位交错 Keccak 在增量路径上重测仍约 ±1%，保持关闭。
+融合 kernel 对每条链只做一次 `public_jacobian`，随后 `INCREMENT_STRIDE-1` 次 `P += G`（G 取自窗口 0 digit 1，走不完整 `add_mixed`，不再做无穷点/零 digit 选择），再按 chunk 分块求逆。`VANITY_BENCH_STRIDE=1` 回到每地址一次标量乘。Dispatch 宽度为 `ceil(count / stride)`。CPU 后端仍逐钥 `from_secret_key`，不走增量。位交错 Keccak 在增量路径上重测仍约 ±1%，保持关闭。
+
+## 链起点契约（2026-09-10）
+
+`AddressBackend` 的 `keys` 改为**链起点**：地址 `j` 属于 `keys[j / stride] + j % stride`，`keys.len() == ceil(count / stride)`；`begin_batch` 额外携带地址数，`end_batch` 校验它与在途命令一致。主机 `fill_secret_keys` 每链只抽一个 CSPRNG 标量，命中、候选与抽样复核用 `chain_key` 现场重算 `起点 + 偏移`（≤ 31 次字节加法）。Metal 输入缓冲缩为 `ceil(capacity / stride) * 32` 字节，kernel 读 `keys + gid*32`。CUDA/Vulkan 的预编译内核仍按每地址一个标量读取，`expand_chain_keys` 在主机展开后上传，行为不变。
+
+起点接受规则 `chain_start_accepted(k, len)`：`len <= 1` 任意有效标量；否则要求 `k >= len` 且 `k + len - 1 <= n - 1`。这恰好排除两类不完整公式的例外：`P0 = i·G`（`k = i`，倍点）与 `P0 = -i·G`（`k + i = n`，无穷点），对 `P += G` 路径同样充分（`k = 1` 与 `k + i = n - 1` 都包含在内）。自检与差分测试的顺序标量从 64 起，任何前缀都能切成合法链。
+
+动机：调度线程每批（262144）此前约 9.3 ms 主机工作——`write_keys` 2.1、`clone_key_batch` 2.6、8 MB 输入 zeroize 2.45、`KeyBatch` 擦除 0.55、匹配 1.4、回读 0.2——与约 9 ms 的 GPU 批时间相当；生产进程的调度线程 `ps -M` 显示 99% CPU。改起点后前四项各缩小 32 倍，匹配改为按字节早退（`prefix_match_len_bytes`，不再展开 40 个 nibble），回读改为一次整块拷贝。
+
+## 仿射批量加（默认，`OPT_AFFINE=1`）
+
+`chain_affine_addresses`：每线程一条链，`P0 = k·G` 走窗口标量乘得到 Jacobian `(X, Y, Z)`；`i·G`（`1 <= i < stride`）取表 row 0 的 digit `i`（要求 radix > stride，故 4-bit 窗口不支持 stride 32）。所有 `i·G` 是仿射常量，`dx_i = gx_i - x0` 只依赖 `P0`，于是整链可与 `Z` 一起做一次 Montgomery 求逆：
+
+- `zz = Z²`，`zzz = Z³`；`d_i = gx_i·zz - X`，`e_i = gy_i·zzz - Y`；则 `λ_i = e_i / (Z·d_i) = e_i · d_i⁻¹ · Z⁻¹`。
+- 前缀积 `prefix[i] = d_1⋯d_i`（填充项贡献 1），`inv = (prefix[S-1]·Z)⁻¹`，`Z⁻¹ = inv·prefix[S-1]`，`inv ← inv·Z`。
+- 反向展开：`d_i⁻¹ = inv·prefix[i-1]`，`inv ← inv·d_i`；`x_i = λ² - x0 - gx_i`，`y_i = λ(x0 - x_i) - y0`。`d_i`、`e_i` 反向时重算（各 1 次乘），换取只存 `prefix[S]`（256 uint，与 chunk-8 路径的 `pts[8]+prefix[8]` 相当）。
+
+每地址约 11 次域乘 + `fe_inverse/32`，对照 `P += G` 路径的 11（mixed add）+ ~34（chunk-8 求逆分摊）+ 6（仿射化）。整链域乘约 1790 → 约 800。例外由主机起点规则排除，kernel 不再做零 Z / 零 d 掩码；错误地址只会浪费工作，命中与候选仍经 CPU 复核。差分测试覆盖 stride 8/32/64、8/16-bit 窗口与全部批次尾部，并与 `affine=false` 的旧路径同批对照。

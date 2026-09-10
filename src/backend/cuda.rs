@@ -60,24 +60,10 @@ impl CudaBackend {
     }
 
     fn self_test(&mut self) -> Result<()> {
-        for keys in super::gpu_self_test_batches(INCREMENT_STRIDE as usize, self.capacity)? {
-            let mut addresses = vec![[0; 20]; keys.len()];
-            self.derive_batch(&keys, &mut addresses)?;
-            for (key, address) in keys.iter().zip(&addresses) {
-                cpu::verify_address(key, address, &self.verifier)?;
-            }
-        }
+        let verifier = Secp256k1::new();
+        super::run_self_test(self, &verifier, self.capacity)?;
         self.sample_index = 0;
         Ok(())
-    }
-
-    fn write_keys(host: &mut Zeroizing<Vec<u8>>, keys: &[SecretKey]) {
-        let bytes = keys.len() * 32;
-        debug_assert!(bytes <= host.len());
-        for (slot, key) in host[..bytes].chunks_exact_mut(32).zip(keys) {
-            let secret = Zeroizing::new(key.secret_bytes());
-            slot.copy_from_slice(secret.as_ref());
-        }
     }
 
     fn wait_slot(&mut self, index: usize) -> Result<()> {
@@ -102,17 +88,18 @@ impl AddressBackend for CudaBackend {
     }
 
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
-        self.begin_batch(keys)?;
+        self.begin_batch(keys, addresses.len())?;
         self.end_batch(keys, addresses)
     }
 
-    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
-        ensure!(keys.len() <= self.capacity, "batch exceeds CUDA capacity");
+    fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
+        ensure!(count <= self.capacity, "batch exceeds CUDA capacity");
+        super::check_chain_batch(keys, count, INCREMENT_STRIDE as usize)?;
         ensure!(
             self.pending < self.slots.len(),
             "CUDA in-flight slots exhausted"
         );
-        if keys.is_empty() {
+        if count == 0 {
             return Ok(());
         }
         let submit_at = (self.collect_at + self.pending) % self.slots.len();
@@ -120,9 +107,15 @@ impl AddressBackend for CudaBackend {
             !self.slots[submit_at].submitted,
             "CUDA slot still holds an in-flight command"
         );
-        Self::write_keys(&mut self.slots[submit_at].host_keys, keys);
-        let key_bytes = keys.len() * 32;
-        let count = keys.len() as u32;
+        // The precompiled PTX reads one scalar per address; expand on the host.
+        super::expand_chain_keys(
+            keys,
+            INCREMENT_STRIDE as usize,
+            count,
+            &mut self.slots[submit_at].host_keys,
+        )?;
+        let key_bytes = count * 32;
+        let count = count as u32;
         let threads = count.div_ceil(INCREMENT_STRIDE);
         let groups = threads.div_ceil(BLOCK_SIZE);
         let cfg = LaunchConfig {
@@ -161,17 +154,14 @@ impl AddressBackend for CudaBackend {
     }
 
     fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
-        ensure!(
-            keys.len() == addresses.len(),
-            "batch input/output lengths differ"
-        );
-        if keys.is_empty() {
+        super::check_chain_batch(keys, addresses.len(), INCREMENT_STRIDE as usize)?;
+        if addresses.is_empty() {
             return Ok(());
         }
         ensure!(self.pending > 0, "no in-flight CUDA batch to collect");
         let collect_at = self.collect_at;
         self.wait_slot(collect_at)?;
-        let address_bytes = keys.len() * 20;
+        let address_bytes = addresses.len() * 20;
         let slot = &mut self.slots[collect_at];
         let mut host = vec![0u8; address_bytes];
         {
@@ -189,8 +179,9 @@ impl AddressBackend for CudaBackend {
         for (index, address) in addresses.iter_mut().enumerate() {
             address.copy_from_slice(&host[index * 20..index * 20 + 20]);
         }
-        let sample = self.sample_index % keys.len();
-        cpu::verify_address(&keys[sample], &addresses[sample], &self.verifier)?;
+        let sample = self.sample_index % addresses.len();
+        let sample_key = super::chain_key(keys, INCREMENT_STRIDE as usize, sample)?;
+        cpu::verify_address(&sample_key, &addresses[sample], &self.verifier)?;
         self.sample_index = self.sample_index.wrapping_add(1);
         slot.stream
             .memset_zeros(&mut slot.keys)
@@ -346,10 +337,11 @@ mod tests {
     fn cuda_differential() -> Result<()> {
         let mut backend = CudaBackend::new(super::super::MAX_GPU_BATCH_SIZE as usize)?
             .context("GPU required for hardware acceptance")?;
+        let stride = backend.increment_stride();
         let keys = super::super::sequential_test_keys(backend.capacity)?;
         for chunk in keys.chunks(backend.capacity) {
             let mut addresses = vec![[0; 20]; chunk.len()];
-            backend.derive_batch(chunk, &mut addresses)?;
+            backend.derive_batch(&super::super::chain_starts(chunk, stride), &mut addresses)?;
             for (key, address) in chunk.iter().zip(&addresses) {
                 cpu::verify_address(key, address, &backend.verifier)?;
             }
@@ -357,7 +349,7 @@ mod tests {
         for count in [1usize, 7, 8, 9, 33, 65] {
             let batch: Vec<_> = keys.iter().copied().take(count).collect();
             let mut addresses = vec![[0; 20]; batch.len()];
-            backend.derive_batch(&batch, &mut addresses)?;
+            backend.derive_batch(&super::super::chain_starts(&batch, stride), &mut addresses)?;
             for (key, address) in batch.iter().zip(&addresses) {
                 cpu::verify_address(key, address, &backend.verifier)?;
             }
@@ -369,19 +361,22 @@ mod tests {
 
     fn inflight_overlap_differential(backend: &mut CudaBackend, keys: &[SecretKey]) -> Result<()> {
         ensure!(keys.len() >= 2, "overlap test needs two keys");
+        let stride = backend.increment_stride();
         let mid = keys.len() / 2;
         let first = &keys[..mid];
         let second = &keys[mid..];
+        let first_starts = super::super::chain_starts(first, stride);
+        let second_starts = super::super::chain_starts(second, stride);
         ensure!(
             backend.inflight_capacity() >= 2,
             "expected two in-flight slots"
         );
-        backend.begin_batch(first)?;
-        backend.begin_batch(second)?;
+        backend.begin_batch(&first_starts, first.len())?;
+        backend.begin_batch(&second_starts, second.len())?;
         let mut first_out = vec![[0; 20]; first.len()];
         let mut second_out = vec![[0; 20]; second.len()];
-        backend.end_batch(first, &mut first_out)?;
-        backend.end_batch(second, &mut second_out)?;
+        backend.end_batch(&first_starts, &mut first_out)?;
+        backend.end_batch(&second_starts, &mut second_out)?;
         for (key, address) in first.iter().zip(&first_out) {
             cpu::verify_address(key, address, &backend.verifier)?;
         }

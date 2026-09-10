@@ -15,15 +15,17 @@ use objc2_metal::{
 use secp256k1::{All, Secp256k1, SecretKey};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{Address, AddressBackend, cpu, table};
+use super::{Address, AddressBackend, chain_count, chain_key, check_chain_batch, cpu, table};
 use crate::timing::{Noop, Observer, Stage};
 
 // Experiments remain available only to the test harness. Arithmetic and
 // threadgroup candidates from earlier rounds stay off; threadgroup Montgomery
 // invert was measured and rejected. Defaults that passed the retention gate:
-// two in-flight GPU commands, 16-bit fixed-base windows, per-thread
-// chunked Montgomery inversion (chunk = 8), and a fused jacobian+invert
-// kernel. Bit-interleaved Keccak stayed within noise and remains off.
+// two in-flight GPU commands, 16-bit fixed-base windows, increment chains of
+// 32 with affine batched addition (one inversion per chain). The fused
+// Jacobian P += G kernel with per-thread chunked inversion (chunk = 8) stays
+// as the `affine = false` comparison path. Bit-interleaved Keccak stayed
+// within noise and remains off.
 #[derive(Clone, Copy)]
 pub(crate) struct MetalConfig {
     pub(crate) bulk: bool,
@@ -37,6 +39,7 @@ pub(crate) struct MetalConfig {
     pub(crate) keccak: bool,
     pub(crate) fuse: bool,
     pub(crate) stride: u8,
+    pub(crate) affine: bool,
 }
 
 impl Default for MetalConfig {
@@ -53,11 +56,21 @@ impl Default for MetalConfig {
             keccak: false,
             fuse: true,
             stride: super::DEFAULT_INCREMENT_STRIDE as u8,
+            affine: true,
         }
     }
 }
 
 impl MetalConfig {
+    /// Chain starts per address batch as seen by the host.
+    fn effective_stride(&self) -> usize {
+        if self.fuse && self.stride > 1 {
+            self.stride as usize
+        } else {
+            1
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             [4, 8, 16].contains(&self.window_bits),
@@ -91,6 +104,14 @@ impl MetalConfig {
                     && self.stride % self.chunk == 0),
             "VANITY_BENCH_STRIDE must be 1, or 8/16/32/64 with fused chunk inversion"
         );
+        // i*G comes from table row 0, which only holds digits below the radix.
+        ensure!(
+            !self.affine
+                || (self.stride > 1
+                    && self.fuse
+                    && (1usize << self.window_bits) > self.stride as usize),
+            "VANITY_BENCH_AFFINE requires increment chains and a window radix above the stride"
+        );
         Ok(())
     }
 }
@@ -106,6 +127,7 @@ impl MetalConfig {
             ("VANITY_BENCH_INVERT", &mut config.invert),
             ("VANITY_BENCH_KECCAK", &mut config.keccak),
             ("VANITY_BENCH_FUSE", &mut config.fuse),
+            ("VANITY_BENCH_AFFINE", &mut config.affine),
         ] {
             if let Ok(value) = std::env::var(name) {
                 *setting = match value.as_str() {
@@ -141,6 +163,14 @@ impl MetalConfig {
             config.stride = value.parse().context("invalid benchmark stride")?;
         } else if !config.fuse || config.chunk == 0 {
             config.stride = 1;
+        }
+        // Affine chains only exist on the fused increment path with i*G in the table.
+        if std::env::var("VANITY_BENCH_AFFINE").is_err()
+            && (config.stride <= 1
+                || !config.fuse
+                || (1usize << config.window_bits) <= config.stride as usize)
+        {
+            config.affine = false;
         }
         config.validate()?;
         Ok(config)
@@ -291,6 +321,8 @@ struct GpuSlot {
     output: SharedBuffer,
     xyz: Option<SharedBuffer>,
     command: Option<CommandCompletion>,
+    /// Addresses requested by the in-flight command; `end` must match it.
+    count: usize,
 }
 
 pub(crate) struct MetalBackend {
@@ -328,7 +360,7 @@ impl MetalBackend {
                 return Ok(None);
             };
             let mut source = format!(
-                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n#define INCREMENT_STRIDE {}\n{}",
+                "#define OPT_SQUARE {}\n#define OPT_ADD {}\n#define OPT_INVERT {}\n#define WINDOW_BITS {}\n#define CHUNK_SIZE {}\n#define OPT_KECCAK {}\n#define INCREMENT_STRIDE {}\n#define OPT_AFFINE {}\n{}",
                 u8::from(config.square),
                 u8::from(config.fast_add),
                 u8::from(config.invert),
@@ -336,6 +368,7 @@ impl MetalBackend {
                 config.chunk,
                 u8::from(config.keccak),
                 config.stride,
+                u8::from(config.affine),
                 include_str!("shader.metal")
             );
             // Diagnostic entry points are not included in production binaries.
@@ -362,7 +395,9 @@ impl MetalBackend {
                     pipeline_with_group(
                         &device,
                         &library,
-                        if config.fuse {
+                        if config.affine {
+                            "chain_affine_addresses"
+                        } else if config.fuse {
                             "chunk_derive_addresses"
                         } else {
                             "chunk_invert_affine_keccak"
@@ -378,15 +413,18 @@ impl MetalBackend {
             let mut table =
                 SharedBuffer::new(&device, table::table_bytes(config.window_bits), false)?;
             populate_table(&mut table, &verifier, config.window_bits)?;
+            // Input holds chain starts only: capacity/stride scalars, not one per address.
+            let key_slots = chain_count(capacity, config.effective_stride());
             let mut slots = Vec::with_capacity(config.inflight as usize);
             for _ in 0..config.inflight {
                 slots.push(GpuSlot {
-                    input: SharedBuffer::new(&device, capacity * 32, true)?,
+                    input: SharedBuffer::new(&device, key_slots * 32, true)?,
                     output: SharedBuffer::new(&device, capacity * 20, false)?,
                     xyz: split
                         .then(|| SharedBuffer::new(&device, capacity * 96, false))
                         .transpose()?,
                     command: None,
+                    count: 0,
                 });
             }
             let mut backend = Self {
@@ -419,13 +457,8 @@ impl MetalBackend {
     }
 
     fn self_test(&mut self) -> Result<()> {
-        for keys in super::gpu_self_test_batches(self.config.stride as usize, self.capacity)? {
-            let mut addresses = vec![[0; 20]; keys.len()];
-            self.derive_batch(&keys, &mut addresses)?;
-            for (key, address) in keys.iter().zip(&addresses) {
-                cpu::verify_address(key, address, &self.verifier)?;
-            }
-        }
+        let verifier = Secp256k1::new();
+        super::run_self_test(self, &verifier, self.capacity)?;
         self.sample_index = 0;
         Ok(())
     }
@@ -628,19 +661,15 @@ impl AddressBackend for MetalBackend {
     }
 
     fn increment_stride(&self) -> usize {
-        if self.config.fuse && self.config.stride > 1 {
-            self.config.stride as usize
-        } else {
-            1
-        }
+        self.config.effective_stride()
     }
 
     fn derive_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
         self.derive_observed(keys, addresses, &Noop)
     }
 
-    fn begin_batch(&mut self, keys: &[SecretKey]) -> Result<()> {
-        self.begin_observed(keys, &Noop)
+    fn begin_batch(&mut self, keys: &[SecretKey], count: usize) -> Result<()> {
+        self.begin_observed(keys, count, &Noop)
     }
 
     fn end_batch(&mut self, keys: &[SecretKey], addresses: &mut [Address]) -> Result<()> {
@@ -655,21 +684,23 @@ impl MetalBackend {
         addresses: &mut [Address],
         observer: &O,
     ) -> Result<()> {
-        self.begin_observed(keys, observer)?;
+        self.begin_observed(keys, addresses.len(), observer)?;
         self.end_observed(keys, addresses, observer)
     }
 
     pub(crate) fn begin_observed<O: Observer>(
         &mut self,
         keys: &[SecretKey],
+        count: usize,
         observer: &O,
     ) -> Result<()> {
-        ensure!(keys.len() <= self.capacity, "batch exceeds Metal capacity");
+        ensure!(count <= self.capacity, "batch exceeds Metal capacity");
+        check_chain_batch(keys, count, self.increment_stride())?;
         ensure!(
             self.pending < self.slots.len(),
             "Metal in-flight slots exhausted"
         );
-        if keys.is_empty() {
+        if count == 0 {
             return Ok(());
         }
         autoreleasepool(|_| {
@@ -700,17 +731,19 @@ impl MetalBackend {
                     .chunk_pipeline
                     .as_ref()
                     .context("fused path missing chunk pipeline")?;
-                let step = if self.config.stride > 1 {
-                    self.config.stride as usize
+                // Increment chains: one thread per chain start (keys.len()).
+                // Otherwise one thread per chunk of independent scalars.
+                let threads = if self.config.stride > 1 {
+                    keys.len()
                 } else {
-                    chunk
+                    count.div_ceil(chunk.max(1))
                 };
                 encode_compute(
                     &completion.command,
                     pipeline,
                     (&slot.input, &self.table, &slot.output),
-                    keys.len(),
-                    keys.len().div_ceil(step.max(1)),
+                    count,
+                    threads,
                     group,
                 )?;
             } else if invert || chunk > 0 {
@@ -723,8 +756,8 @@ impl MetalBackend {
                     &completion.command,
                     jacobian,
                     (&slot.input, &self.table, xyz),
-                    keys.len(),
-                    keys.len(),
+                    count,
+                    count,
                     group,
                 )?;
                 let (second, threads) = if invert {
@@ -732,19 +765,19 @@ impl MetalBackend {
                         .invert_pipeline
                         .as_ref()
                         .context("invert path missing invert pipeline")?;
-                    (pipeline, keys.len())
+                    (pipeline, count)
                 } else {
                     let pipeline = self
                         .chunk_pipeline
                         .as_ref()
                         .context("chunk path missing chunk pipeline")?;
-                    (pipeline, keys.len().div_ceil(chunk))
+                    (pipeline, count.div_ceil(chunk))
                 };
                 encode_compute(
                     &completion.command,
                     second,
                     (xyz, &self.table, &slot.output),
-                    keys.len(),
+                    count,
                     threads,
                     group,
                 )?;
@@ -753,13 +786,14 @@ impl MetalBackend {
                     &completion.command,
                     &self.pipeline,
                     (&slot.input, &self.table, &slot.output),
-                    keys.len(),
-                    keys.len(),
+                    count,
+                    count,
                     group,
                 )?;
             }
             completion.commit(observer, encoded);
             self.slots[submit_at].command = Some(completion);
+            self.slots[submit_at].count = count;
             self.pending += 1;
             Ok(())
         })
@@ -771,11 +805,9 @@ impl MetalBackend {
         addresses: &mut [Address],
         observer: &O,
     ) -> Result<()> {
-        ensure!(
-            keys.len() == addresses.len(),
-            "batch input/output lengths differ"
-        );
-        if keys.is_empty() {
+        let stride = self.increment_stride();
+        check_chain_batch(keys, addresses.len(), stride)?;
+        if addresses.is_empty() {
             return Ok(());
         }
         ensure!(self.pending > 0, "no in-flight Metal batch to collect");
@@ -787,18 +819,19 @@ impl MetalBackend {
                 .context("Metal slot missing in-flight command")?;
             command.wait(observer)?;
             let slot = &mut self.slots[collect_at];
+            ensure!(
+                slot.count == addresses.len(),
+                "Metal batch output length differs from the submitted count"
+            );
             let read = observer.start();
-            if self.config.bulk {
-                slot.output.read(0, addresses.as_flattened_mut());
-            } else {
-                for (index, address) in addresses.iter_mut().enumerate() {
-                    slot.output.read(index * 20, address);
-                }
-            }
+            // One bounds check and one copy for the packed 20-byte addresses; the
+            // dispatch thread is the host budget now that inputs are chain starts.
+            slot.output.read(0, addresses.as_flattened_mut());
             observer.finish(Stage::ReadbackCleanup, read);
             let verified = observer.start();
-            let sample = self.sample_index % keys.len();
-            cpu::verify_address(&keys[sample], &addresses[sample], &self.verifier)?;
+            let sample = self.sample_index % addresses.len();
+            let sample_key = chain_key(keys, stride, sample)?;
+            cpu::verify_address(&sample_key, &addresses[sample], &self.verifier)?;
             self.sample_index = self.sample_index.wrapping_add(1);
             observer.finish(Stage::SampleVerify, verified);
             let cleared = observer.start();
@@ -836,7 +869,10 @@ mod tests {
         let output = SharedBuffer::new(&backend.device, keys.len().max(1) * 64, false)?;
         let mut public = vec![[0; 64]; keys.len()];
         if !keys.is_empty() {
-            let upload = upload_keys(&mut backend.slots[0].input, keys);
+            // The production input only holds chain starts; this diagnostic
+            // derives every scalar, so it gets its own (wiped) buffer.
+            let mut input = SharedBuffer::new(&backend.device, keys.len() * 32, true)?;
+            let upload = upload_keys(&mut input, keys);
             dispatch(
                 &backend.queue,
                 &pipeline,
@@ -965,14 +1001,17 @@ mod tests {
             backend.inflight_capacity() >= 2 && keys.len() >= 66,
             "inflight overlap requires two slots"
         );
+        let stride = backend.increment_stride();
         let first = &keys[..33];
         let second = &keys[33..66];
+        let first_starts = super::super::chain_starts(first, stride);
+        let second_starts = super::super::chain_starts(second, stride);
         let mut out_first = vec![[0; 20]; first.len()];
         let mut out_second = vec![[0; 20]; second.len()];
-        backend.begin_batch(first)?;
-        backend.begin_batch(second)?;
-        backend.end_batch(first, &mut out_first)?;
-        backend.end_batch(second, &mut out_second)?;
+        backend.begin_batch(&first_starts, first.len())?;
+        backend.begin_batch(&second_starts, second.len())?;
+        backend.end_batch(&first_starts, &mut out_first)?;
+        backend.end_batch(&second_starts, &mut out_second)?;
         for (key, address) in first.iter().zip(&out_first) {
             cpu::verify_address(key, address, &backend.verifier)?;
         }
@@ -984,8 +1023,29 @@ mod tests {
 
     #[test]
     fn metal_config_rejects_invalid_window_inflight_and_chunk() {
+        let mut affine = MetalConfig::default();
+        assert!(affine.validate().is_ok());
+        affine.window_bits = 4; // radix 16 cannot index i*G for stride 32
+        assert!(affine.validate().is_err());
+        affine.window_bits = 8;
+        assert!(affine.validate().is_ok());
+        affine.stride = 64;
+        assert!(affine.validate().is_ok());
+        affine.window_bits = 4;
+        affine.stride = 8;
+        assert!(affine.validate().is_ok());
+        affine.stride = 16;
+        assert!(affine.validate().is_err());
+        affine.window_bits = 16;
+        affine.stride = 1;
+        assert!(affine.validate().is_err());
+        affine.stride = 32;
+        affine.fuse = false;
+        assert!(affine.validate().is_err());
+
         let mut invalid = MetalConfig {
             window_bits: 5,
+            affine: false,
             ..MetalConfig::default()
         };
         assert!(invalid.validate().is_err());
@@ -1051,25 +1111,10 @@ mod tests {
             while keys.len() < backend.capacity {
                 keys.push(crate::search::generate_secret_key(&mut rng));
             }
-            let seq_keys = {
-                let mut bytes = [0; 32];
-                bytes[31] = 2;
-                let mut key = SecretKey::from_byte_array(bytes)?;
-                let mut chain = Vec::with_capacity(backend.capacity);
-                for index in 0..backend.capacity {
-                    if index > 0 {
-                        key = super::super::increment_secret_key(&key)
-                            .context("sequential test key overflow")?;
-                    }
-                    chain.push(key);
-                }
-                chain
-            };
-            let address_keys = if backend.increment_stride() > 1 {
-                &seq_keys
-            } else {
-                &keys
-            };
+            // Consecutive scalars from 64: every prefix slices into accepted chains.
+            let seq_keys = super::super::sequential_test_keys(backend.capacity)?;
+            let stride = backend.increment_stride();
+            let address_keys = if stride > 1 { &seq_keys } else { &keys };
             {
                 let mut dual = MetalConfig::from_env()?;
                 dual.inflight = 2;
@@ -1093,7 +1138,10 @@ mod tests {
                 };
             for &count in counts {
                 let mut addresses = vec![[0; 20]; count];
-                backend.derive_batch(&address_keys[..count], &mut addresses)?;
+                backend.derive_batch(
+                    &super::super::chain_starts(&address_keys[..count], stride),
+                    &mut addresses,
+                )?;
                 let public = diagnostic_public_keys(&mut backend, &address_keys[..count])?;
                 for index in 0..count {
                     let expected_public =
@@ -1119,18 +1167,21 @@ mod tests {
                 eprintln!("GPU differential batch {count}: passed");
             }
             // Structural variants around the defaults: unchunked path, chunk
-            // sizes 4/8/16/32, window widths, interleaved Keccak, and increment
-            // strides. Tails are covered by counts that are not multiples of 4/8.
+            // sizes 4/8/16/32, window widths, interleaved Keccak, increment
+            // strides, and the affine chain kernel against the P += G kernel.
+            // Tails are covered by counts that are not multiples of 4/8/32.
             let candidates = [
                 MetalConfig {
                     chunk: 0,
                     window_bits: 8,
                     fuse: false,
                     stride: 1,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
                     chunk: 4,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
@@ -1140,7 +1191,14 @@ mod tests {
                 },
                 MetalConfig {
                     chunk: 8,
+                    window_bits: 8,
+                    affine: false,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
+                    chunk: 8,
                     window_bits: 4,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
@@ -1150,10 +1208,12 @@ mod tests {
                 MetalConfig {
                     fuse: false,
                     stride: 1,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
                     stride: 1,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
@@ -1162,15 +1222,28 @@ mod tests {
                     ..MetalConfig::default()
                 },
                 MetalConfig {
+                    stride: 8,
+                    chunk: 8,
+                    affine: false,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
                     stride: 64,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
+                    stride: 64,
+                    affine: false,
+                    ..MetalConfig::default()
+                },
+                MetalConfig {
                     chunk: 16,
+                    affine: false,
                     ..MetalConfig::default()
                 },
                 MetalConfig {
                     chunk: 32,
+                    affine: false,
                     ..MetalConfig::default()
                 },
             ];
@@ -1178,9 +1251,13 @@ mod tests {
                 let batch_keys = if config.stride > 1 { &seq_keys } else { &keys };
                 let mut candidate = MetalBackend::with_config(4099, config)?
                     .context("GPU required for hardware acceptance")?;
+                let stride = candidate.increment_stride();
                 for &count in &[1usize, 33, 129, 4095, 4099] {
                     let mut addresses = vec![[0; 20]; count];
-                    candidate.derive_batch(&batch_keys[..count], &mut addresses)?;
+                    candidate.derive_batch(
+                        &super::super::chain_starts(&batch_keys[..count], stride),
+                        &mut addresses,
+                    )?;
                     for index in 0..count {
                         assert_eq!(
                             addresses[index],

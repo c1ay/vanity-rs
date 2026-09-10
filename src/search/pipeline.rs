@@ -143,19 +143,19 @@ where
         (1..=crate::backend::MAX_GPU_BATCH_SIZE as usize).contains(&batch_size),
         "invalid pipeline batch size"
     );
+    let stride = backend.increment_stride().max(1);
     let (ready_tx, ready_rx) = channel::bounded(1);
     let (recycle_tx, recycle_rx) = channel::bounded(2);
     for _ in 0..2 {
         recycle_tx.send(PreparedBatch {
             sequence: 0,
-            keys: KeyBatch(Vec::with_capacity(batch_size)),
+            keys: KeyBatch(Vec::with_capacity(chain_count(batch_size, stride))),
         })?;
     }
     std::thread::scope(|scope| {
         // On consumer unwind this guard cancels before scope's implicit join.
         let _scope_stop = StopOnExit(stop);
         let producer_observer = observer.clone();
-        let stride = backend.increment_stride().max(1);
         let producer = scope.spawn(move || {
             produce(
                 recycle_rx,
